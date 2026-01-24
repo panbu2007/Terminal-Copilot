@@ -72,14 +72,16 @@ def _persist_client_state() -> bool:
     Override with env: TERMINAL_COPILOT_PERSIST_CLIENT_STATE=1/0
     """
 
-    # Default to NOT persisting client state ("0") to keep demo behavior deterministic.
-    # Set TERMINAL_COPILOT_PERSIST_CLIENT_STATE=1 to enable persistence.
-    flag = os.getenv("TERMINAL_COPILOT_PERSIST_CLIENT_STATE", "0").strip().lower()
+    # Default:
+    # - Local/dev: persist (1)
+    # - Container/Spaces: do not persist (0)
+    # Override with env: TERMINAL_COPILOT_PERSIST_CLIENT_STATE=1/0
+    flag = os.getenv("TERMINAL_COPILOT_PERSIST_CLIENT_STATE", "auto").strip().lower()
     if flag in {"1", "true", "yes", "on"}:
         return True
     if flag in {"0", "false", "no", "off"}:
         return False
-    return False
+    return not _is_running_in_container()
 
 
 @app.get("/api/health")
