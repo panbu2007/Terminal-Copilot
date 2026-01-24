@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+.conda/
+
+# Local secrets
+.secrets/
+
+# VCS
+.git/
+.gitignore
+
+# Docs / misc
+docs/
+docker/
+
+# OS
+.DS_Store
+Thumbs.db

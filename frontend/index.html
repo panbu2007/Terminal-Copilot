@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Terminal Copilot</title>
+    <link rel="stylesheet" href="https://unpkg.com/xterm/css/xterm.css" />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">Terminal Copilot</div>
+      <div class="modes">
+        <label><input type="radio" name="mode" value="suggest" checked /> 只建议</label>
+        <label><input type="radio" name="mode" value="assist" /> 建议+执行</label>
+      </div>
+      <div class="segmented" id="executorSwitch" aria-label="执行器切换">
+        <button class="seg-btn" data-exec="simulate" type="button">simulate</button>
+        <button class="seg-btn" data-exec="local" type="button">local</button>
+      </div>
+      <button id="llm" class="btn-export">LLM设置</button>
+      <button id="export" class="btn-export">导出回放</button>
+      <div class="status" id="status">连接中…</div>
+    </header>
+
+    <main class="layout">
+      <section class="terminal-pane">
+        <div id="terminal" class="terminal"></div>
+        <div id="hint" class="hint"></div>
+      </section>
+
+      <aside class="side-pane">
+        <div class="side-title">步骤面板</div>
+        <div id="steps" class="steps"></div>
+        <div class="side-subtitle">下一步建议</div>
+        <div id="suggestions" class="suggestions"></div>
+      </aside>
+    </main>
+
+    <!-- LLM Token Modal -->
+    <div id="llmModal" class="modal hidden" aria-hidden="true">
+      <div class="modal-backdrop"></div>
+      <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="llmTitle">
+        <div class="modal-title" id="llmTitle">配置 ModelScope</div>
+        <div class="modal-body">
+          <div class="explain">Token 将写入本地 <span class="mono">.secrets/modelscope_access_token.txt</span>（已加入 gitignore）。同时会保存在当前浏览器标签页会话（刷新不丢，关闭标签页会清除）。</div>
+          <input id="llmTokenInput" class="modal-input" type="password" placeholder="粘贴 ModelScope Access Token" autocomplete="off" />
+          <div class="explain">模型ID（ModelScope Model-Id），例如：<span class="mono">Qwen/Qwen2.5-Coder-32B-Instruct</span></div>
+          <div id="llmModelDropdown" class="dropdown">
+            <button id="llmModelDropdownBtn" class="modal-input dropdown-btn" type="button" aria-haspopup="listbox" aria-expanded="false">
+              常用模型（点击选择后自动填入）…
+            </button>
+            <div id="llmModelDropdownMenu" class="dropdown-menu hidden" role="listbox" aria-label="常用模型">
+              <div class="dropdown-item" role="option" tabindex="0" data-value="Qwen/Qwen2.5-Coder-32B-Instruct">Qwen/Qwen2.5-Coder-32B-Instruct（代码最强）</div>
+              <div class="dropdown-item" role="option" tabindex="0" data-value="deepseek-ai/DeepSeek-R1">deepseek-ai/DeepSeek-R1（推理/规划强）</div>
+              <div class="dropdown-item" role="option" tabindex="0" data-value="MiniMax/MiniMax-M2.1">MiniMax/MiniMax-M2.1（长周期规划/Agent）</div>
+              <div class="dropdown-item" role="option" tabindex="0" data-value="Qwen/Qwen3-32B">Qwen/Qwen3-32B（Qwen3 通用）</div>
+              <div class="dropdown-item" role="option" tabindex="0" data-value="ZhipuAI/GLM-4.7">ZhipuAI/GLM-4.7（通用/Agent）</div>
+            </div>
+          </div>
+          <input id="llmModelInput" class="modal-input" type="text" placeholder="Qwen/Qwen2.5-Coder-32B-Instruct" autocomplete="off" />
+          <div id="llmModalHint" class="explain"></div>
+        </div>
+        <div class="modal-actions">
+          <button id="llmTest">测试连接</button>
+          <button id="llmClose">取消</button>
+          <button id="llmSave" class="primary">保存</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="https://unpkg.com/xterm/lib/xterm.js"></script>
+    <script src="https://unpkg.com/xterm-addon-fit/lib/xterm-addon-fit.js"></script>
+    <script src="/static/app.js"></script>
+  </body>
+</html>
