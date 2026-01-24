@@ -298,7 +298,7 @@ def suggest(req: SuggestRequest) -> list[CommandSuggestion]:
                         verify=it.get("verify", ""),
                         risk_level=RiskLevel.safe,
                         tags=["llm"],
-                        citations=retrieve(it.get("command") or it.get("title") or last),
+                        citations=retrieve(it.get("command") or ""),
                     )
                 )
         except Exception as e:

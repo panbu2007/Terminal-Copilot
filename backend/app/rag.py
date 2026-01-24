@@ -59,6 +59,15 @@ def _score(doc: Doc, tokens: list[str]) -> int:
     return score
 
 
+def _token_hits(doc: Doc, tokens: list[str]) -> int:
+    t = doc.text.lower()
+    hits = 0
+    for tok in tokens:
+        if tok and tok in t:
+            hits += 1
+    return hits
+
+
 def _snippet(text: str, tokens: list[str], max_len: int = 200) -> str:
     low = text.lower()
     idx = -1
@@ -82,19 +91,31 @@ def _snippet(text: str, tokens: list[str], max_len: int = 200) -> str:
     return s
 
 
-def retrieve(query: str, *, limit: int = 2) -> list[Citation]:
+def retrieve(query: str, *, limit: int = 2, min_score: int = 6, min_hits: int = 2) -> list[Citation]:
     tokens = _tokenize(query)
     if not tokens:
         return []
 
-    scored: list[tuple[int, Doc]] = []
+    scored: list[tuple[int, int, Doc]] = []
     for d in _load_docs():
         s = _score(d, tokens)
-        if s > 0:
-            scored.append((s, d))
+        if s <= 0:
+            continue
+        h = _token_hits(d, tokens)
+        scored.append((s, h, d))
 
-    scored.sort(key=lambda x: x[0], reverse=True)
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    if not scored:
+        return []
+
+    # Relevance gate: if top doc is weakly related, don't show any citations.
+    top_score, top_hits, _ = scored[0]
+    if top_score < min_score or top_hits < min_hits:
+        return []
+
     out: list[Citation] = []
-    for _, d in scored[:limit]:
+    for s, h, d in scored[:limit]:
+        if s < min_score or h < min_hits:
+            continue
         out.append(Citation(title=d.title, snippet=_snippet(d.text, tokens)))
     return out

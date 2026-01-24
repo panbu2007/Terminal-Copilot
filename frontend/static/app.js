@@ -723,6 +723,20 @@ function prompt() {
   term.write(`\r\n${PROMPT}`);
   currentLine = '';
 }
+
+function clearTerminalUi() {
+  try {
+    term.reset();
+  } catch {
+    try {
+      term.clear();
+    } catch {
+      // ignore
+    }
+  }
+  term.write('Terminal Copilot (MVP)');
+  currentLine = '';
+}
 function writeError(msg) {
   term.write(`\r\n\x1b[31m${msg}\x1b[0m`);
 }
@@ -1256,12 +1270,13 @@ if (executorSwitchEl) {
 if (resetBtn) {
   resetBtn.addEventListener('click', async () => {
     try {
-      const ok = confirm('清空本地 Token/历史并创建新会话？');
+      const ok = confirm('创建新会话并清空当前控制台/历史？（不会清空本地 LLM Token）');
       if (!ok) return;
       statusEl.textContent = '重置中…';
-      await resetClientState({ clearToken: true, newSession: true });
-      term.write('\r\n');
-      writeInfoAbovePrompt('已创建新会话');
+      // Keep the LLM token in sessionStorage; only reset session/timeline/UI.
+      await resetClientState({ clearToken: false, newSession: true });
+      clearTerminalUi();
+      writeInfoAbovePrompt('已创建新会话（保留本地 LLM Token）');
       setStatusReady();
     } catch (e) {
       statusEl.textContent = '错误';
