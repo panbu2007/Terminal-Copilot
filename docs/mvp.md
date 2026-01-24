@@ -6,17 +6,19 @@
 
 ## 页面结构
 - 左侧：Web 终端（输入/输出）
-- 右侧：步骤面板（Plan → Execute → Verify）
+- 右侧：任务流时间线（按回合追加：Plan → Execute → Verify → Next，不覆盖）
 - 顶部：模式切换
   - 只建议（不执行）
   - 建议 + 执行（需要确认）
+  - Ctrl+C：best-effort 中断 local 执行
 
 ## 交互闭环
 1. 用户在终端执行/编辑
 2. 系统观察上下文：最近命令、退出码、关键输出、文件变更事件（MVP 先做“命令输出触发”）
 3. Planner 给出 1~3 条下一步候选
-4. 用户一键接受（填入终端）或一键执行
-5. Verifier 解析输出，标记成功/失败，失败给出分支修复建议
+4. 建议卡结构化呈现：why / risk / rollback / verify + 引用依据
+5. 用户一键接受（填入终端）或一键执行
+6. Verifier 解析输出，标记成功/失败；失败时补充 self-heal（例如定位命令、查看用法）
 
 ## 三个 Demo（脚本在 docs/demo-*.md）
 - Demo1：Docker 换源工作流

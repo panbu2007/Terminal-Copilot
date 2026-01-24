@@ -2,6 +2,40 @@
 
 面向比赛的 AI 应用：把“记忆驱动的命令行”升级为“意图驱动的工作流”，在 Web 终端里提供下一步命令补全、步骤化执行、输出校验与安全护栏。
 
+## 电梯稿（30 秒）
+
+Terminal Copilot 把“用户敲命令 → 报错/卡住 → 搜索/问人 → 再敲命令”的低效循环，变成“输入一次 → 立刻得到下一步可执行建议（含 why/risk/rollback/verify）→ 一键执行 → 自动校验”的闭环。
+它面向新同学/学生/运维新人：在不改变原有命令行习惯的前提下，用任务流时间线把零散命令串成可回放、可验收的工作流。
+
+## 架构（简图）
+
+```
+Browser
+	├─ xterm.js 终端输入/输出
+	├─ 右侧任务流时间线（回合追加，不覆盖）
+	└─ LLM 设置（仅前端会话存 Token；后端落盘到 .secrets 可选）
+				│
+				▼
+FastAPI (backend/app/main.py)
+	├─ /api/suggest   Planner(规则) + LLM fallback + Self-heal + RAG 引用
+	├─ /api/execute   Executor(simulate/local) + Policy 护栏 + Verifier 校验
+	├─ /api/interrupt Ctrl+C 中断（local best-effort）
+	└─ SessionStore   steps/events/导出回放
+				│
+				▼
+Local Executor (subprocess one-shot, supports cwd/cd)
+```
+
+## 评分点映射（主赛道常见维度）
+
+| 评分维度 | 我们的落点 | 你可以怎么演示 |
+| --- | --- | --- |
+| 场景价值 | 新同学/运维新人“下一步该做什么” | Demo 1/2/3 任选，强调闭环与可验收 |
+| 用户体验 | xterm 终端 + 回合时间线 + 一键执行 | 连续执行 2-3 条命令，右侧持续追加 |
+| 工具整合 | Policy/Verifier/RAG/LLM fallback | 展示 warn 二次确认、校验步骤、引用依据 |
+| 技术前瞻 | 结构化建议字段 + 轻量多 Agent 标签 | 建议卡展示 agent/why/risk/rollback/verify |
+| 材料完整 | export 回放 + docs/demo 脚本 | 一键导出 events.json 作为“可回放证据” |
+
 ## 本地启动（开发）
 
 > 本项目当前采用 **Python + FastAPI** 一体化启动，并由后端直接托管静态前端（不依赖 Node.js）。
