@@ -42,10 +42,54 @@ FRONTEND_STATIC_DIR = FRONTEND_DIR / "static"
 app = FastAPI(title="Terminal Copilot", version="0.1.0")
 
 
+def _is_running_in_container() -> bool:
+    """Best-effort container detection (for hosted Spaces behavior)."""
+    try:
+        if Path("/.dockerenv").exists():
+            return True
+    except Exception:
+        pass
+
+    try:
+        p = Path("/proc/1/cgroup")
+        if p.exists():
+            t = p.read_text(encoding="utf-8", errors="ignore")
+            if any(k in t for k in ("docker", "kubepods", "containerd", "podman")):
+                return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _persist_client_state() -> bool:
+    """Whether the frontend should persist token/session across refresh.
+
+    Default:
+      - Local/dev: True
+      - Container/Spaces: False (avoid cross-run interference in public demos)
+
+    Override with env: TERMINAL_COPILOT_PERSIST_CLIENT_STATE=1/0
+    """
+
+    # Default to NOT persisting client state ("0") to keep demo behavior deterministic.
+    # Set TERMINAL_COPILOT_PERSIST_CLIENT_STATE=1 to enable persistence.
+    flag = os.getenv("TERMINAL_COPILOT_PERSIST_CLIENT_STATE", "0").strip().lower()
+    if flag in {"1", "true", "yes", "on"}:
+        return True
+    if flag in {"0", "false", "no", "off"}:
+        return False
+    return False
+
+
 @app.get("/api/health")
 def health() -> dict[str, str]:
     ex = get_executor()
-    return {"status": "ok", "executor": ex.name}
+    return {
+        "status": "ok",
+        "executor": ex.name,
+        "persist_client_state": "1" if _persist_client_state() else "0",
+    }
 
 
 @app.get("/api/executor/status", response_model=ExecutorStatusResponse)

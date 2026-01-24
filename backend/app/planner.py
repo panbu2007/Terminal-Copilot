@@ -242,18 +242,6 @@ def suggest(req: SuggestRequest) -> list[CommandSuggestion]:
         )
 
     # Generic: when command failed
-    if req.last_exit_code is not None and req.last_exit_code != 0 and not suggestions:
-        suggestions.append(
-            CommandSuggestion(
-                id="show-help",
-                title="查看帮助/用法",
-                command=f"{last} --help" if last else "help",
-                explanation="命令执行失败时，优先查看用法与可用参数。",
-                risk_level=RiskLevel.safe,
-                tags=["fallback"],
-            )
-        )
-
     # Optional LLM fallback (ModelScope API-Inference, OpenAI-compatible)
     llm_flag = os.getenv("TERMINAL_COPILOT_LLM_ENABLED", "auto").strip().lower()
     llm_enabled = llm_flag in {"1", "true", "yes", "on"}
@@ -298,6 +286,21 @@ def suggest(req: SuggestRequest) -> list[CommandSuggestion]:
                     explanation=f"ModelScope 调用失败：{str(e)[:200]}",
                     risk_level=RiskLevel.safe,
                     tags=["llm", "error"],
+                )
+            )
+
+    # Generic: when command failed — only add `--help` if we still have no actionable suggestions.
+    if req.last_exit_code is not None and req.last_exit_code != 0:
+        has_actionable = any((s.command or "").strip() and s.command != "(auto)" for s in suggestions)
+        if not has_actionable and last:
+            suggestions.append(
+                CommandSuggestion(
+                    id="show-help",
+                    title="查看帮助/用法",
+                    command=f"{last} --help",
+                    explanation="命令失败时可先查看用法与可用参数（LLM 无可执行建议时自动补充）。",
+                    risk_level=RiskLevel.safe,
+                    tags=["fallback"],
                 )
             )
 

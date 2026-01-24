@@ -5,6 +5,7 @@ const stepsEl = document.getElementById('steps');
 const suggestionsEl = document.getElementById('suggestions');
 const hintEl = document.getElementById('hint');
 const exportBtn = document.getElementById('export');
+const resetBtn = document.getElementById('reset');
 const llmBtn = document.getElementById('llm');
 const llmModal = document.getElementById('llmModal');
 const llmTokenInput = document.getElementById('llmTokenInput');
@@ -56,6 +57,45 @@ function getSessionId() {
 
 function setSessionId(id) {
   localStorage.setItem('tc_session_id', id);
+}
+
+function clearSessionId() {
+  try {
+    localStorage.removeItem('tc_session_id');
+  } catch {
+    // ignore
+  }
+}
+
+function clearCachedLlmToken() {
+  cachedLlmToken = '';
+  try {
+    sessionStorage.removeItem(LLM_TOKEN_STORAGE_KEY);
+  } catch {
+    // ignore
+  }
+}
+
+async function resetClientState({ clearToken = true, newSession = true } = {}) {
+  clearSessionId();
+  if (clearToken) clearCachedLlmToken();
+
+  // Clear UI panels
+  try {
+    if (stepsEl) stepsEl.innerHTML = '';
+    if (suggestionsEl) suggestionsEl.innerHTML = '';
+    setHint('');
+  } catch {
+    // ignore
+  }
+
+  if (newSession) {
+    try {
+      await apiNewSession();
+    } catch {
+      // ignore
+    }
+  }
 }
 
 async function postJson(url, body) {
@@ -845,6 +885,16 @@ if (executorSwitchEl) {
 
 (async () => {
   try {
+    const h = await apiHealth();
+
+    // Hosted Spaces: avoid persisting token/session across refresh by default.
+    // Backend returns persist_client_state as "1" or "0".
+    const persist = String(h.persist_client_state || '1') === '1';
+    if (!persist) {
+      await resetClientState({ clearToken: true, newSession: true });
+      writeInfoAbovePrompt('已重置：刷新不会保留 Token/历史（创空间默认）');
+    }
+
     const st = await refreshExecutorStatus({ updateReadyText: false });
     const m = st ? (st.mode || st.current_mode) : '';
     if (m) {
@@ -852,13 +902,31 @@ if (executorSwitchEl) {
       setStatusReady();
       return;
     }
-    const h = await apiHealth();
     if (h && h.executor) currentExecutorMode = String(h.executor);
     setStatusReady();
   } catch {
     statusEl.textContent = '后端未连接';
   }
 })();
+
+if (resetBtn) {
+  resetBtn.addEventListener('click', async () => {
+    try {
+      const ok = confirm('清空本地 Token/历史并创建新会话？');
+      if (!ok) return;
+      statusEl.textContent = '重置中…';
+      await resetClientState({ clearToken: true, newSession: true });
+      term.write('\r\n');
+      writeInfoAbovePrompt('已创建新会话');
+      setStatusReady();
+    } catch (e) {
+      statusEl.textContent = '错误';
+      writeError(String(e.message || e));
+    } finally {
+      prompt();
+    }
+  });
+}
 
 if (exportBtn) {
   exportBtn.addEventListener('click', async () => {
