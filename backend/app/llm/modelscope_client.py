@@ -110,14 +110,15 @@ def modelscope_chat_json_suggestions(
 ) -> list[dict[str, str]]:
     """Ask the LLM for next-command suggestions and parse strict JSON.
 
-    Returns: list of {title, command, explanation}
+    Returns: list of {title, command, explanation, why, risk, rollback, verify}
     """
 
     system = (
         "你是一个终端命令助手。根据用户意图/上下文，给出下一步可执行命令。\n"
         "要求：\n"
         "- 只返回严格 JSON 数组（不要代码块/不要多余文字）\n"
-        "- 每个元素是对象：{\"title\":..., \"command\":..., \"explanation\":...}\n"
+        "- 每个元素是对象，最少包含：{\"title\":..., \"command\":...}\n"
+        "- 可选字段：explanation, why, risk, rollback, verify（都为字符串）\n"
         "- 命令要尽量最小、安全、可逆；避免破坏性命令（rm -rf、mkfs、关机等）\n"
         "- 最多 5 条建议\n"
     )
@@ -157,8 +158,22 @@ def modelscope_chat_json_suggestions(
         title = str(item.get("title", "")).strip()
         command = str(item.get("command", "")).strip()
         explanation = str(item.get("explanation", "")).strip()
+        why = str(item.get("why", "")).strip()
+        risk = str(item.get("risk", "")).strip()
+        rollback = str(item.get("rollback", "")).strip()
+        verify = str(item.get("verify", "")).strip()
         if not title or not command:
             continue
-        out.append({"title": title, "command": command, "explanation": explanation})
+        out.append(
+            {
+                "title": title,
+                "command": command,
+                "explanation": explanation,
+                "why": why,
+                "risk": risk,
+                "rollback": rollback,
+                "verify": verify,
+            }
+        )
 
     return out

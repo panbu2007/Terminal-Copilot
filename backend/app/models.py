@@ -23,6 +23,10 @@ class CommandSuggestion(BaseModel):
     title: str
     command: str
     explanation: str
+    why: str = ""
+    risk: str = ""
+    rollback: str = ""
+    verify: str = ""
     risk_level: RiskLevel = RiskLevel.safe
     requires_confirmation: bool = False
     tags: list[str] = Field(default_factory=list)

@@ -273,8 +273,13 @@ def suggest(req: SuggestRequest) -> list[CommandSuggestion]:
                         title=it["title"],
                         command=it["command"],
                         explanation=it.get("explanation", ""),
+                        why=it.get("why", ""),
+                        risk=it.get("risk", ""),
+                        rollback=it.get("rollback", ""),
+                        verify=it.get("verify", ""),
                         risk_level=RiskLevel.safe,
                         tags=["llm"],
+                        citations=retrieve(it.get("command") or it.get("title") or last),
                     )
                 )
         except Exception as e:
@@ -289,8 +294,41 @@ def suggest(req: SuggestRequest) -> list[CommandSuggestion]:
                 )
             )
 
-    # Generic: when command failed — only add `--help` if we still have no actionable suggestions.
+    # Generic: when command failed — add self-heal hints. Only add `--help` if we still have no actionable suggestions.
     if req.last_exit_code is not None and req.last_exit_code != 0:
+        cmd0 = (last.split() or [""])[0]
+
+        # If common "command not found" on Windows, help locate the binary.
+        if req.platform == "windows" and ("不是内部或外部命令" in stderr or "not recognized" in stderr.lower()):
+            if cmd0:
+                suggestions.append(
+                    CommandSuggestion(
+                        id="selfheal-where",
+                        title="自愈：定位命令是否存在（where）",
+                        command=f"where {cmd0}",
+                        explanation="如果命令不存在/不在 PATH，这一步能快速定位可执行文件。",
+                        why="错误看起来像是命令未找到。",
+                        risk="安全（只读查询）。",
+                        verify="若 where 无输出，说明 PATH 中未找到该命令。",
+                        tags=["selfheal", "verify"],
+                    )
+                )
+        # Linux/mac: command not found
+        if req.platform in {"linux", "mac"} and ("command not found" in stderr.lower()):
+            if cmd0:
+                suggestions.append(
+                    CommandSuggestion(
+                        id="selfheal-which",
+                        title="自愈：定位命令是否存在（which）",
+                        command=f"which {cmd0}",
+                        explanation="如果命令未安装/不在 PATH，这一步能快速判断。",
+                        why="错误看起来像是命令未找到。",
+                        risk="安全（只读查询）。",
+                        verify="若 which 无输出，通常表示 PATH 中未找到该命令。",
+                        tags=["selfheal", "verify"],
+                    )
+                )
+
         has_actionable = any((s.command or "").strip() and s.command != "(auto)" for s in suggestions)
         if not has_actionable and last:
             suggestions.append(
@@ -299,8 +337,9 @@ def suggest(req: SuggestRequest) -> list[CommandSuggestion]:
                     title="查看帮助/用法",
                     command=f"{last} --help",
                     explanation="命令失败时可先查看用法与可用参数（LLM 无可执行建议时自动补充）。",
-                    risk_level=RiskLevel.safe,
-                    tags=["fallback"],
+                    why="当前没有足够信息给出可执行修复步骤时，--help 最稳妥。",
+                    risk="安全（只读输出）。",
+                    tags=["fallback", "selfheal"],
                 )
             )
 

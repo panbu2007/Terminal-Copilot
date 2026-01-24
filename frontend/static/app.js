@@ -592,6 +592,15 @@ function renderSuggestions(suggestions, insertFn, executeFn) {
     explain.className = 'explain';
     explain.textContent = s.explanation;
 
+    function addExplainLine(label, value) {
+      const v = String(value || '').trim();
+      if (!v) return;
+      const line = document.createElement('div');
+      line.className = 'explain';
+      line.textContent = `${label}：${v}`;
+      card.appendChild(line);
+    }
+
     const actions = document.createElement('div');
     actions.className = 'actions';
 
@@ -610,6 +619,11 @@ function renderSuggestions(suggestions, insertFn, executeFn) {
       card.appendChild(title);
       card.appendChild(cmd);
       card.appendChild(explain);
+
+      addExplainLine('Why', s.why);
+      addExplainLine('Risk', s.risk);
+      addExplainLine('Rollback', s.rollback);
+      addExplainLine('Verify', s.verify);
 
       if (Array.isArray(s.citations) && s.citations.length > 0) {
         for (const c of s.citations.slice(0, 3)) {
