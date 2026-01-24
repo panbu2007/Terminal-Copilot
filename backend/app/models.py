@@ -23,6 +23,7 @@ class CommandSuggestion(BaseModel):
     title: str
     command: str
     explanation: str
+    agent: str = ""
     why: str = ""
     risk: str = ""
     rollback: str = ""

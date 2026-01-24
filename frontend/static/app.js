@@ -582,7 +582,8 @@ function renderSuggestions(suggestions, insertFn, executeFn) {
     const title = document.createElement('div');
     title.className = 'card-title';
     const confirmTag = s.requires_confirmation ? ' · 需确认' : '';
-    title.innerHTML = `<span>${escapeHtml(s.title)}${confirmTag}</span><span class="badge ${badgeClass(s.risk_level)}">${escapeHtml(s.risk_level)}</span>`;
+    const agentTag = s.agent ? ` · ${escapeHtml(s.agent)}` : '';
+    title.innerHTML = `<span>${escapeHtml(s.title)}${agentTag}${confirmTag}</span><span class="badge ${badgeClass(s.risk_level)}">${escapeHtml(s.risk_level)}</span>`;
 
     const cmd = document.createElement('div');
     cmd.className = 'cmd';
