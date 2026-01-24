@@ -70,6 +70,15 @@ class ExecuteResponse(BaseModel):
     steps: list[StepModel] = Field(default_factory=list)
 
 
+class InterruptRequest(BaseModel):
+    session_id: UUID
+
+
+class InterruptResponse(BaseModel):
+    ok: bool
+    message: str = ""
+
+
 class SessionResponse(BaseModel):
     session_id: UUID
     created_at: str

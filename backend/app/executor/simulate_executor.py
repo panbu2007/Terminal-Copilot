@@ -6,7 +6,14 @@ from .base import ExecResult, Executor
 class SimulateExecutor(Executor):
     name = "simulate"
 
-    def run(self, command: str, *, confirmed: bool, cwd: str | None = None) -> ExecResult:
+    def run(
+        self,
+        command: str,
+        *,
+        confirmed: bool,
+        cwd: str | None = None,
+        session_id: str | None = None,
+    ) -> ExecResult:
         cmd = command.strip()
 
         # Simple canned outputs for demos.
@@ -31,3 +38,6 @@ class SimulateExecutor(Executor):
 
         # Default
         return ExecResult(0, f"(simulate) ok: {cmd}\n", "")
+
+    def interrupt(self, session_id: str) -> bool:
+        return False

@@ -264,6 +264,15 @@ async function apiExecute(command, confirmed = false) {
   return data;
 }
 
+async function apiInterrupt() {
+  let sid = getSessionId();
+  if (!sid) {
+    await apiNewSession();
+    sid = getSessionId();
+  }
+  return postJson('/api/interrupt', { session_id: sid });
+}
+
 async function apiSuggest(last) {
   const payload = {
     session_id: getSessionId() || null,
@@ -662,6 +671,39 @@ try {
 let currentLine = '';
 const PROMPT = '> ';
 
+let isExecuting = false;
+
+const history = [];
+let historyIndex = 0;
+
+function redrawPromptLine(nextLine) {
+  const s = String(nextLine || '');
+  currentLine = s;
+  term.write('\x1b[2K\r');
+  term.write(`${PROMPT}${s}`);
+}
+
+function pushHistory(cmd) {
+  const c = String(cmd || '').trim();
+  if (!c) return;
+  const last = history.length ? history[history.length - 1] : '';
+  if (last !== c) history.push(c);
+  historyIndex = history.length;
+}
+
+function historyUp() {
+  if (!history.length) return;
+  if (historyIndex > 0) historyIndex -= 1;
+  redrawPromptLine(history[historyIndex] || '');
+}
+
+function historyDown() {
+  if (!history.length) return;
+  if (historyIndex < history.length) historyIndex += 1;
+  const v = historyIndex >= history.length ? '' : (history[historyIndex] || '');
+  redrawPromptLine(v);
+}
+
 function prompt() {
   term.write(`\r\n${PROMPT}`);
   currentLine = '';
@@ -685,6 +727,7 @@ function writeInfoAbovePrompt(msg) {
 async function runCommand(cmd, confirmed = false) {
   try {
     statusEl.textContent = '执行中…';
+    isExecuting = true;
     const execRes = await apiExecute(cmd, confirmed);
 
     // Best-effort sync current executor (backend returns executor name per run).
@@ -741,8 +784,17 @@ async function runCommand(cmd, confirmed = false) {
       setStatusReady();
       return;
     }
-    if (execRes.stdout) term.write(`\r\n${execRes.stdout.replaceAll('\n', '\r\n')}`);
-    if (execRes.stderr) term.write(`\r\n${execRes.stderr.replaceAll('\n', '\r\n')}`);
+    const MAX_TERM_CHARS = 8000;
+    if (execRes.stdout) {
+      const out = String(execRes.stdout);
+      const shown = out.length > MAX_TERM_CHARS ? (out.slice(0, MAX_TERM_CHARS) + '\n…（输出过长已截断，完整内容在右侧时间线可下载）\n') : out;
+      term.write(`\r\n${shown.replaceAll('\n', '\r\n')}`);
+    }
+    if (execRes.stderr) {
+      const err = String(execRes.stderr);
+      const shown = err.length > MAX_TERM_CHARS ? (err.slice(0, MAX_TERM_CHARS) + '\n…（stderr 过长已截断，完整内容在右侧时间线可下载）\n') : err;
+      term.write(`\r\n\x1b[31m${shown.replaceAll('\n', '\r\n')}\x1b[0m`);
+    }
 
     const sug = await apiSuggest({
       command: cmd,
@@ -787,6 +839,7 @@ async function runCommand(cmd, confirmed = false) {
     statusEl.textContent = '错误';
     writeError(String(e.message || e));
   } finally {
+    isExecuting = false;
     prompt();
   }
 }
@@ -1053,6 +1106,39 @@ document.addEventListener('click', (ev) => {
 });
 
 term.onData(async (data) => {
+  // Ctrl+C
+  if (data === '\x03') {
+    if (isExecuting) {
+      writeInfoAbovePrompt('^C 中断中…');
+      try {
+        const res = await apiInterrupt();
+        if (res && res.ok) writeInfoAbovePrompt('已发送中断信号。');
+        else writeInfoAbovePrompt('当前无可中断的运行任务。');
+      } catch (e) {
+        writeError(String(e.message || e));
+      }
+      return;
+    }
+    term.write('^C');
+    prompt();
+    return;
+  }
+
+  // 执行中：锁定输入（只允许 Ctrl+C）
+  if (isExecuting) {
+    return;
+  }
+
+  // Arrow keys (history)
+  if (data === '\x1b[A') {
+    historyUp();
+    return;
+  }
+  if (data === '\x1b[B') {
+    historyDown();
+    return;
+  }
+
   // Enter
   if (data === '\r') {
     const cmd = currentLine.trim();
@@ -1064,6 +1150,7 @@ term.onData(async (data) => {
       await runSuggestOnly(cmd.slice(1).trim());
       return;
     }
+    pushHistory(cmd);
     await runCommand(cmd);
     return;
   }

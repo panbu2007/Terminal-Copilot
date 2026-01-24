@@ -17,6 +17,8 @@ from .models import (
     ExecutorStatusResponse,
     EventsResponse,
     ExportResponse,
+    InterruptRequest,
+    InterruptResponse,
     LlmConfigRequest,
     LlmStatusResponse,
     LlmTestRequest,
@@ -492,7 +494,7 @@ def api_execute(req: ExecuteRequest) -> ExecuteResponse:
         executor = get_executor()
     else:
         executor = get_executor()
-        result = executor.run(req.command, confirmed=req.confirmed, cwd=session.cwd)
+        result = executor.run(req.command, confirmed=req.confirmed, cwd=session.cwd, session_id=str(session.id))
 
     STORE.add_event(
         session,
@@ -533,6 +535,27 @@ def api_execute(req: ExecuteRequest) -> ExecuteResponse:
         executor=executor.name,
         steps=STORE.to_dict_steps(session),
     )
+
+
+@app.post("/api/interrupt", response_model=InterruptResponse)
+def api_interrupt(req: InterruptRequest) -> InterruptResponse:
+    session = STORE.get(req.session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="session_not_found")
+
+    ex = get_executor()
+    ok = False
+    try:
+        ok = bool(ex.interrupt(str(req.session_id)))
+    except Exception:
+        ok = False
+
+    STORE.add_event(
+        session,
+        kind="interrupt",
+        payload={"ok": str(ok), "executor": ex.name},
+    )
+    return InterruptResponse(ok=ok, message="interrupted" if ok else "no_running_process")
 
 
 # Static frontend hosting
