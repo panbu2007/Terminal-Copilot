@@ -21,6 +21,43 @@ const executorSwitchEl = document.getElementById('executorSwitch');
 
 let currentExecutorMode = '';
 
+// Timeline (infinite UI)
+let timelineRounds = [];
+let lastSuggestionsCache = [];
+
+function timelineStorageKey() {
+  const sid = getSessionId();
+  return sid ? `tc_timeline_${sid}` : 'tc_timeline_nosession';
+}
+
+function saveTimeline() {
+  try {
+    sessionStorage.setItem(timelineStorageKey(), JSON.stringify(timelineRounds));
+  } catch {
+    // ignore
+  }
+}
+
+function loadTimeline() {
+  try {
+    const raw = sessionStorage.getItem(timelineStorageKey());
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) timelineRounds = parsed;
+  } catch {
+    // ignore
+  }
+}
+
+function clearTimeline() {
+  timelineRounds = [];
+  try {
+    sessionStorage.removeItem(timelineStorageKey());
+  } catch {
+    // ignore
+  }
+}
+
 function setStatusReady() {
   const mode = currentExecutorMode ? String(currentExecutorMode) : 'unknown';
   statusEl.textContent = `就绪（executor=${mode}）`;
@@ -79,6 +116,8 @@ function clearCachedLlmToken() {
 async function resetClientState({ clearToken = true, newSession = true } = {}) {
   clearSessionId();
   if (clearToken) clearCachedLlmToken();
+
+  clearTimeline();
 
   // Clear UI panels
   try {
@@ -292,6 +331,208 @@ function clearSuggestions() {
   setHint('');
 }
 
+function formatTs(ts) {
+  try {
+    const d = new Date(ts);
+    if (Number.isNaN(d.getTime())) return String(ts || '');
+    return d.toLocaleString();
+  } catch {
+    return String(ts || '');
+  }
+}
+
+function makeSmallButton(text, onClick) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.textContent = text;
+  b.onclick = onClick;
+  return b;
+}
+
+function downloadText(filename, text) {
+  const blob = new Blob([String(text || '')], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+function appendRound(round) {
+  timelineRounds.push(round);
+  saveTimeline();
+  renderTimeline();
+}
+
+function updateLastRound(patch) {
+  if (!timelineRounds.length) return;
+  const r = timelineRounds[timelineRounds.length - 1];
+  Object.assign(r, patch || {});
+  saveTimeline();
+  renderTimeline();
+}
+
+function extractVerificationSteps(steps, cmd) {
+  if (!Array.isArray(steps) || steps.length === 0) return [];
+  // Find the last execution step for this command
+  let idx = -1;
+  for (let i = steps.length - 1; i >= 0; i--) {
+    const st = steps[i];
+    if (st && st.title === '执行命令' && String(st.command || '') === String(cmd || '')) {
+      idx = i;
+      break;
+    }
+  }
+  if (idx < 0) return [];
+  const out = [];
+  for (let j = idx + 1; j < steps.length; j++) {
+    const st = steps[j];
+    if (!st) continue;
+    if (st.title === '执行命令') break;
+    if (String(st.command || '') !== String(cmd || '')) continue;
+    // verification / policy steps are appended after execute
+    out.push(st);
+  }
+  return out;
+}
+
+function renderTimeline() {
+  if (!stepsEl) return;
+  stepsEl.innerHTML = '';
+
+  if (!Array.isArray(timelineRounds) || timelineRounds.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'card';
+    empty.innerHTML = '<div class="explain">尚未执行命令。执行一次后这里会按回合持续追加（不会覆盖）。</div>';
+    stepsEl.appendChild(empty);
+    return;
+  }
+
+  for (let i = 0; i < timelineRounds.length; i++) {
+    const r = timelineRounds[i];
+    const wrap = document.createElement('div');
+    wrap.className = 'timeline-round';
+
+    const head = document.createElement('div');
+    head.className = 'round-head';
+
+    const title = document.createElement('div');
+    title.className = 'round-title';
+    title.textContent = `回合 #${i + 1}`;
+
+    const meta = document.createElement('div');
+    meta.className = 'round-meta';
+    const mode = r.executor ? `executor=${r.executor}` : 'executor=?';
+    const code = (typeof r.exit_code === 'number') ? `exit=${r.exit_code}` : '';
+    meta.textContent = `${formatTs(r.ts)}  ${mode}${code ? '  ' + code : ''}`;
+
+    head.appendChild(title);
+    head.appendChild(meta);
+    wrap.appendChild(head);
+
+    // Plan
+    const stPlan = document.createElement('div');
+    stPlan.className = 'stage';
+    const stPlanTitle = document.createElement('div');
+    stPlanTitle.className = 'stage-title';
+    stPlanTitle.textContent = '计划（建议来源）';
+    stPlan.appendChild(stPlanTitle);
+    const planText = document.createElement('div');
+    planText.className = 'explain';
+    if (r.plan && r.plan.title) {
+      planText.textContent = `来自建议：${r.plan.title}`;
+    } else {
+      planText.textContent = '用户手动输入（或未匹配到建议）。';
+    }
+    stPlan.appendChild(planText);
+    wrap.appendChild(stPlan);
+
+    // Execute
+    const stExec = document.createElement('div');
+    stExec.className = 'stage';
+    const stExecTitle = document.createElement('div');
+    stExecTitle.className = 'stage-title';
+    stExecTitle.textContent = '执行';
+    stExec.appendChild(stExecTitle);
+
+    const cmd = document.createElement('div');
+    cmd.className = 'cmd';
+    cmd.textContent = String(r.command || '');
+    stExec.appendChild(cmd);
+
+    const actions = document.createElement('div');
+    actions.className = 'small-actions';
+
+    if (r.stdout) {
+      actions.appendChild(makeSmallButton('下载 stdout', () => downloadText(`round-${i + 1}-stdout.txt`, r.stdout)));
+    }
+    if (r.stderr) {
+      actions.appendChild(makeSmallButton('下载 stderr', () => downloadText(`round-${i + 1}-stderr.txt`, r.stderr)));
+    }
+    if (actions.children.length > 0) stExec.appendChild(actions);
+
+    const out = (r.stdout || '').trim();
+    const err = (r.stderr || '').trim();
+    if (out) {
+      const outDiv = document.createElement('div');
+      outDiv.className = 'output';
+      outDiv.textContent = out.length > 2000 ? (out.slice(0, 2000) + '\n…（已截断，完整内容可下载）') : out;
+      stExec.appendChild(outDiv);
+    }
+    if (err) {
+      const errDiv = document.createElement('div');
+      errDiv.className = 'output';
+      errDiv.style.color = 'rgba(255, 92, 122, 0.92)';
+      errDiv.textContent = err.length > 2000 ? (err.slice(0, 2000) + '\n…（已截断，完整内容可下载）') : err;
+      stExec.appendChild(errDiv);
+    }
+    if (!out && !err) {
+      const none = document.createElement('div');
+      none.className = 'output is-muted';
+      none.textContent = '（无输出）';
+      stExec.appendChild(none);
+    }
+
+    wrap.appendChild(stExec);
+
+    // Verify
+    const stVer = document.createElement('div');
+    stVer.className = 'stage';
+    const stVerTitle = document.createElement('div');
+    stVerTitle.className = 'stage-title';
+    stVerTitle.textContent = '校验 / 护栏';
+    stVer.appendChild(stVerTitle);
+
+    if (Array.isArray(r.verify_steps) && r.verify_steps.length > 0) {
+      for (const v of r.verify_steps) {
+        const line = document.createElement('div');
+        line.className = 'explain';
+        const ok = v.status === 'success';
+        line.textContent = `${ok ? '通过' : '失败'}：${v.title}${v.detail ? ' — ' + v.detail : ''}`;
+        stVer.appendChild(line);
+      }
+    } else {
+      const line = document.createElement('div');
+      line.className = 'explain';
+      line.textContent = '（暂无可用校验规则）';
+      stVer.appendChild(line);
+    }
+    wrap.appendChild(stVer);
+
+    stepsEl.appendChild(wrap);
+  }
+
+  // Keep scrolled to bottom (infinite append UX)
+  try {
+    stepsEl.scrollTop = stepsEl.scrollHeight;
+  } catch {
+    // ignore
+  }
+}
+
 function findLastPolicyDetail(steps, titles) {
   if (!Array.isArray(steps)) return '';
   for (let i = steps.length - 1; i >= 0; i--) {
@@ -302,35 +543,11 @@ function findLastPolicyDetail(steps, titles) {
 }
 
 function renderSteps(steps) {
-  if (!stepsEl) return;
-  stepsEl.innerHTML = '';
-  if (!Array.isArray(steps) || steps.length === 0) {
-    stepsEl.innerHTML = '<div class="card"><div class="explain">暂无步骤记录</div></div>';
-    return;
-  }
-
-  // newest last
-  for (const st of steps.slice(-8)) {
-    const card = document.createElement('div');
-    card.className = 'card';
-
-    const title = document.createElement('div');
-    title.className = 'card-title';
-    title.innerHTML = `<span>${escapeHtml(st.title)}</span><span class="badge ${badgeClass(st.status === 'failed' ? 'block' : (st.status === 'planned' ? 'safe' : 'safe'))}">${escapeHtml(st.status)}</span>`;
-
-    const cmd = document.createElement('div');
-    cmd.className = 'cmd';
-    cmd.textContent = st.command;
-
-    const detail = document.createElement('div');
-    detail.className = 'explain';
-    detail.textContent = st.detail || '';
-
-    card.appendChild(title);
-    card.appendChild(cmd);
-    if (st.detail) card.appendChild(detail);
-    stepsEl.appendChild(card);
-  }
+  // Deprecated: steps panel is now a timeline.
+  // We keep this function for compatibility but redirect to timeline rendering.
+  // (Some code paths still call renderSteps with backend steps.)
+  void steps;
+  renderTimeline();
 }
 
 function badgeClass(level) {
@@ -341,6 +558,7 @@ function badgeClass(level) {
 
 function renderSuggestions(suggestions, insertFn, executeFn) {
   clearSuggestions();
+  lastSuggestionsCache = Array.isArray(suggestions) ? suggestions : [];
   if (!suggestions || suggestions.length === 0) {
     suggestionsEl.innerHTML = '<div class="card"><div class="explain">暂无建议（继续输入命令或触发 Demo）</div></div>';
     return;
@@ -480,7 +698,24 @@ async function runCommand(cmd, confirmed = false) {
       }
     }
 
-    renderSteps(execRes.steps);
+    // Append a new timeline round immediately after execution.
+    appendRound({
+      ts: Date.now(),
+      command: cmd,
+      executor: execRes && execRes.executor ? String(execRes.executor) : '',
+      exit_code: typeof execRes.exit_code === 'number' ? execRes.exit_code : null,
+      stdout: execRes.stdout || '',
+      stderr: execRes.stderr || '',
+      verify_steps: extractVerificationSteps(execRes.steps, cmd),
+      plan: (() => {
+        try {
+          const m = (lastSuggestionsCache || []).find((x) => x && x.command === cmd);
+          return m ? { id: m.id, title: m.title } : null;
+        } catch {
+          return null;
+        }
+      })(),
+    });
 
     const lastStep = Array.isArray(execRes.steps) && execRes.steps.length > 0 ? execRes.steps[execRes.steps.length - 1] : null;
     const lastDetail = lastStep && lastStep.detail ? String(lastStep.detail) : '';
@@ -516,7 +751,10 @@ async function runCommand(cmd, confirmed = false) {
       stderr: execRes.stderr,
     });
 
-    renderSteps(sug.steps);
+    // Update the last round with any verify step appended after suggest (planned steps are not verification).
+    updateLastRound({
+      verify_steps: extractVerificationSteps(sug.steps, cmd),
+    });
 
     renderSuggestions(
       sug.suggestions,
@@ -555,6 +793,10 @@ async function runCommand(cmd, confirmed = false) {
 
 term.write('Terminal Copilot (MVP)');
 prompt();
+
+// Try restore timeline for current session (local dev refresh behavior)
+loadTimeline();
+renderTimeline();
 
 (async () => {
   try {

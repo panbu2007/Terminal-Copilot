@@ -131,6 +131,78 @@ body {
   background: rgba(17, 24, 49, 0.55);
 }
 
+.timeline-round {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px;
+  background: rgba(17, 24, 49, 0.55);
+}
+
+.round-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.round-title {
+  font-weight: 700;
+}
+
+.round-meta {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.stage {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed rgba(255, 255, 255, 0.10);
+}
+
+.stage-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  letter-spacing: 0.2px;
+  text-transform: none;
+}
+
+.small-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.small-actions button {
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+  border-radius: 10px;
+  padding: 6px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.small-actions button:hover {
+  background: rgba(255, 255, 255, 0.10);
+}
+
+.output {
+  margin-top: 8px;
+  white-space: pre-wrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New";
+  font-size: 12px;
+  color: rgba(231, 234, 243, 0.88);
+  line-height: 1.45;
+}
+
+.output.is-muted {
+  color: rgba(231, 234, 243, 0.55);
+}
+
 .card-title {
   display: flex;
   align-items: center;
