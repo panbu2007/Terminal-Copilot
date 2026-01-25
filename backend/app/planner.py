@@ -11,6 +11,46 @@ def _cit(title: str, snippet: str) -> Citation:
     return Citation(title=title, snippet=snippet)
 
 
+def _parse_git_branch_output(stdout: str) -> tuple[str | None, set[str], set[str]]:
+    """Parse output of `git branch` / `git branch -a`.
+
+    Returns: (current_local_branch, local_branches, remote_branches)
+
+    Note: remote branches are returned in the form `origin/main` (without `remotes/`).
+    """
+
+    current: str | None = None
+    local: set[str] = set()
+    remote: set[str] = set()
+
+    for raw in (stdout or "").splitlines():
+        line = raw.strip("\r\n")
+        if not line.strip():
+            continue
+
+        is_current = line.lstrip().startswith("*")
+        name = line.strip()
+        if is_current:
+            # Original line may look like: "* master"
+            name = name.lstrip()[1:].strip()
+
+        # Filter symbolic refs like: "remotes/origin/HEAD -> origin/master"
+        if "->" in name:
+            continue
+
+        if name.startswith("remotes/"):
+            name = name[len("remotes/") :]
+            if name:
+                remote.add(name)
+        else:
+            if name:
+                local.add(name)
+                if is_current:
+                    current = name
+
+    return current, local, remote
+
+
 def suggest(req: SuggestRequest) -> list[CommandSuggestion]:
     last = (req.last_command or "").strip()
     stdout = req.last_stdout or ""
@@ -166,18 +206,72 @@ def suggest(req: SuggestRequest) -> list[CommandSuggestion]:
         )
 
     # Demo2: git typo
-    if last.startswith("git ") and ("chekcout" in last or "checkot" in last):
+    if last.startswith("git ") and ("chekcout" in last or "checkot" in last or "chekout" in last):
         suggestions.append(
             CommandSuggestion(
                 id="fix-git-checkout",
                 title="修复拼写：checkout",
-                command=last.replace("chekcout", "checkout").replace("checkot", "checkout"),
+                command=last.replace("chekcout", "checkout").replace("checkot", "checkout").replace("chekout", "checkout"),
                 explanation="git 子命令拼写错误，给出最小修复命令。",
                 agent="rules",
                 risk_level=RiskLevel.safe,
                 citations=retrieve("git not a git command checkout"),
             )
         )
+
+    # Demo2: branch list output -> propose safer next step (avoid detached HEAD)
+    if last in {"git branch", "git branch -a", "git branch --all"} and stdout.strip():
+        current, local_branches, remote_branches = _parse_git_branch_output(stdout)
+
+        # Prefer switching to an existing local default branch.
+        preferred_local = None
+        for cand in ("main", "master"):
+            if cand in local_branches:
+                preferred_local = cand
+                break
+
+        if preferred_local:
+            suggestions.append(
+                CommandSuggestion(
+                    id=f"git-switch-{preferred_local}",
+                    title=f"切换到本地分支：{preferred_local}",
+                    command=f"git switch {preferred_local}",
+                    explanation=(
+                        "从分支列表选择本地分支进行切换；相比 checkout 远端分支，可避免进入 detached HEAD。"
+                        + ("（你当前已在该分支）" if preferred_local == current else "")
+                    ),
+                    risk_level=RiskLevel.safe,
+                    citations=retrieve("git switch branch"),
+                )
+            )
+
+        # If only remote exists (e.g. origin/main), suggest creating a tracking branch.
+        for cand in ("main", "master"):
+            remote_name = f"origin/{cand}"
+            if remote_name in remote_branches and cand not in local_branches:
+                suggestions.append(
+                    CommandSuggestion(
+                        id=f"git-track-{cand}",
+                        title=f"创建本地 {cand} 并跟踪 {remote_name}",
+                        command=f"git switch -c {cand} --track {remote_name}",
+                        explanation="如果本地没有该分支，但远端存在，建议创建 tracking 分支；避免直接 `git checkout origin/...` 导致 detached HEAD。",
+                        risk_level=RiskLevel.safe,
+                        citations=retrieve("git switch -c --track"),
+                    )
+                )
+
+        # Fallback: show status to confirm current branch.
+        if not any(s.id.startswith("git-switch-") or s.id.startswith("git-track-") for s in suggestions):
+            suggestions.append(
+                CommandSuggestion(
+                    id="git-branch-next-status",
+                    title="确认当前分支与工作区状态",
+                    command="git status",
+                    explanation="分支列表已输出；下一步建议用 git status 确认当前所在分支以及是否有未提交变更。",
+                    risk_level=RiskLevel.safe,
+                    citations=retrieve("git status"),
+                )
+            )
 
     # Demo2: natural language trigger
     if ("git" in last_lower) and ("拼写" in last or "typo" in last_lower or "not a git command" in last_lower):
