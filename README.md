@@ -48,11 +48,6 @@ pip install -r backend/requirements.txt
 python -m uvicorn backend.app.main:app --reload --port 8000
 ```
 
-或使用比赛/容器入口（自动读取 `PORT`，默认 7860）：
-
-```bash
-python app.py
-```
 
 ### 3) 访问
 
