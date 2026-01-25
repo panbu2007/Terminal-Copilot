@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import os
+import time
+import hashlib
 from pathlib import Path
 import shlex
 
@@ -46,6 +48,52 @@ app = FastAPI(title="Terminal Copilot", version="0.1.0")
 
 logger = logging.getLogger("terminal_copilot")
 
+_STARTED_AT_TS = time.time()
+
+
+def _safe_read_git_head(repo_root: Path) -> str:
+    """Best-effort: return a short git sha if .git is available (dev), else empty."""
+    try:
+        head = repo_root / ".git" / "HEAD"
+        if not head.exists():
+            return ""
+        ref = head.read_text(encoding="utf-8", errors="ignore").strip()
+        if ref.startswith("ref:"):
+            ref_path = ref.split(":", 1)[1].strip()
+            p = repo_root / ".git" / ref_path
+            if p.exists():
+                return p.read_text(encoding="utf-8", errors="ignore").strip()[:12]
+            return ""
+        # detached HEAD
+        return ref[:12]
+    except Exception:
+        return ""
+
+
+def _file_fingerprint(p: Path) -> str:
+    """Stable-ish fingerprint for logs: sha256(whole file)[:12] + size + mtime."""
+    try:
+        if not p.exists() or not p.is_file():
+            return "missing"
+        data = p.read_bytes()
+        h = hashlib.sha256(data).hexdigest()[:12]
+        st = p.stat()
+        return f"sha256={h} size={st.st_size} mtime={int(st.st_mtime)}"
+    except Exception as e:
+        return f"error:{type(e).__name__}"
+
+
+def _runtime_build_id() -> str:
+    # Prefer an explicit build id if the platform injects it.
+    b = (os.getenv("TERMINAL_COPILOT_BUILD_ID") or os.getenv("GIT_SHA") or "").strip()
+    if b:
+        return b[:20]
+    sha = _safe_read_git_head(REPO_ROOT)
+    if sha:
+        return sha
+    # Fall back to asset fingerprints (works in Docker images without .git).
+    return _file_fingerprint(FRONTEND_STATIC_DIR / "app.js").split(" ", 1)[0].replace("sha256=", "")
+
 
 def _llm_token_configured() -> bool:
     return has_modelscope_token() or bool(os.getenv("MODELSCOPE_ACCESS_TOKEN")) or bool(
@@ -55,6 +103,26 @@ def _llm_token_configured() -> bool:
 
 @app.on_event("startup")
 def _startup_llm_guide() -> None:
+    # Startup fingerprint: helps verify the actual running version in hosted logs.
+    try:
+        build_id = _runtime_build_id()
+        logger.warning(
+            "Terminal Copilot startup: build_id=%s started_at=%s pid=%s port=%s",
+            build_id,
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(_STARTED_AT_TS)),
+            os.getpid(),
+            os.getenv("PORT", ""),
+        )
+        logger.warning(
+            "Frontend assets: index.html=%s app.js=%s styles.css=%s",
+            _file_fingerprint(FRONTEND_DIR / "index.html"),
+            _file_fingerprint(FRONTEND_STATIC_DIR / "app.js"),
+            _file_fingerprint(FRONTEND_STATIC_DIR / "styles.css"),
+        )
+    except Exception:
+        # Never block startup due to logging.
+        pass
+
     if _llm_token_configured():
         return
     logger.warning(

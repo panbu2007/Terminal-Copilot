@@ -253,14 +253,18 @@ def retrieve(query: str, *, limit: int = 2, min_score: int = 6, min_hits: int = 
         h = _token_hits(d, tokens)
         scored.append((s, h, d))
 
+    if not scored:
+        return []
+
     # Two-stage ranking: first take topK by primary score/hits, then rerank by keyword/title matches.
     scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
-    primary_top_score, primary_top_hits, _ = scored[0]
     topk = int(os.getenv("TERMINAL_COPILOT_RAG_TOPK", "10"))
     scored = scored[: max(1, topk)]
     scored = _rerank(scored, tokens)
     if not scored:
         return []
+
+    primary_top_score, primary_top_hits, _ = scored[0]
 
     # Relevance gate: if top doc is weakly related, don't show any citations.
     if primary_top_score < min_score or primary_top_hits < min_hits:
