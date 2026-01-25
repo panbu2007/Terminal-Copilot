@@ -4,6 +4,7 @@ import logging
 import os
 import time
 import hashlib
+import platform as _platform
 from pathlib import Path
 import shlex
 
@@ -43,6 +44,20 @@ APP_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = APP_ROOT.parent.parent
 FRONTEND_DIR = REPO_ROOT / "frontend"
 FRONTEND_STATIC_DIR = FRONTEND_DIR / "static"
+
+
+def _runtime_platform() -> str:
+    """Return platform of the machine running this backend.
+
+    Suggestions should match the executor environment (backend host), not the browser OS.
+    """
+
+    s = (_platform.system() or "").strip().lower()
+    if "windows" in s:
+        return "windows"
+    if s in {"darwin", "mac", "macos"}:
+        return "mac"
+    return "linux"
 
 app = FastAPI(title="Terminal Copilot", version="0.1.0")
 
@@ -287,6 +302,18 @@ def api_export(session_id: str) -> ExportResponse:
 @app.post("/api/suggest", response_model=SuggestResponse)
 def api_suggest(req: SuggestRequest) -> SuggestResponse:
     session = STORE.get_or_create(req.session_id)
+
+    server_platform = _runtime_platform()
+    if req.platform != server_platform:
+        try:
+            req.extra = dict(req.extra or {})
+            if req.platform:
+                req.extra.setdefault("client_platform", req.platform)
+            req.extra.setdefault("server_platform", server_platform)
+        except Exception:
+            pass
+        req.platform = server_platform  # type: ignore[assignment]
+
     suggestions = suggest(req)
 
     # Observability: record whether LLM suggestions are present / error fallback happened
@@ -318,6 +345,7 @@ def api_suggest(req: SuggestRequest) -> SuggestResponse:
         kind="suggest",
         payload={
             "last_command": req.last_command,
+            "platform": str(req.platform or ""),
             "count": str(len(suggestions)),
         },
     )
