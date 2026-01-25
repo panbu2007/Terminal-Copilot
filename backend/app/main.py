@@ -585,10 +585,26 @@ def api_interrupt(req: InterruptRequest) -> InterruptResponse:
 
 
 # Static frontend hosting
+class _NoCacheStaticFiles(StaticFiles):
+    async def get_response(self, path: str, scope):  # type: ignore[override]
+        resp = await super().get_response(path, scope)
+        # Hosted environments (e.g. ModelScope Spaces) can cache aggressively.
+        # Disable caching so new deployments immediately reflect frontend updates.
+        resp.headers.setdefault("Cache-Control", "no-store")
+        resp.headers.setdefault("Pragma", "no-cache")
+        return resp
+
+
 if FRONTEND_STATIC_DIR.exists():
-    app.mount("/static", StaticFiles(directory=str(FRONTEND_STATIC_DIR)), name="static")
+    app.mount("/static", _NoCacheStaticFiles(directory=str(FRONTEND_STATIC_DIR)), name="static")
 
 
 @app.get("/")
 def index() -> FileResponse:
-    return FileResponse(str(FRONTEND_DIR / "index.html"))
+    return FileResponse(
+        str(FRONTEND_DIR / "index.html"),
+        headers={
+            "Cache-Control": "no-store",
+            "Pragma": "no-cache",
+        },
+    )
