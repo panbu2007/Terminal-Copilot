@@ -509,10 +509,18 @@ def suggest(req: SuggestRequest) -> list[CommandSuggestion]:
     for s in uniq:
         if not s.command or s.command == "(auto)":
             continue
-        query = f"{s.title}\n{s.command}\n{s.explanation}"
-        extra = retrieve(query, limit=2)
-        if extra:
-            s.citations.extend(extra)
+
+        # IMPORTANT: avoid using free-form explanation as RAG query.
+        # Explanations (especially from LLM) may contain generic platform words and cause irrelevant citations.
+        # Prefer command-centric retrieval; optionally include the title for a bit more context.
+        if not s.citations:
+            if (s.agent or "").lower() == "llm":
+                query = s.command
+            else:
+                query = f"{s.command}\n{s.title}" if s.title else s.command
+            extra = retrieve(query, limit=2)
+            if extra:
+                s.citations.extend(extra)
 
         # de-duplicate and cap
         seen = set()

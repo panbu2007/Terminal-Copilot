@@ -16,6 +16,7 @@ class RiskLevel(str, Enum):
 class Citation(BaseModel):
     title: str
     snippet: str
+    source: str = ""
 
 
 class CommandSuggestion(BaseModel):
@@ -72,6 +73,7 @@ class ExecuteResponse(BaseModel):
     stdout: str
     stderr: str
     executor: str
+    cwd: str = ""
     steps: list[StepModel] = Field(default_factory=list)
 
 
@@ -87,6 +89,7 @@ class InterruptResponse(BaseModel):
 class SessionResponse(BaseModel):
     session_id: UUID
     created_at: str
+    cwd: str = ""
     steps: list[StepModel] = Field(default_factory=list)
 
 
@@ -98,6 +101,7 @@ class EventsResponse(BaseModel):
 class ExportResponse(BaseModel):
     session_id: UUID
     created_at: str
+    cwd: str = ""
     steps: list[StepModel] = Field(default_factory=list)
     events: list[dict[str, str]] = Field(default_factory=list)
 

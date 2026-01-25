@@ -89,13 +89,28 @@ def modelscope_chat_completion(messages: list[dict[str, str]], *, temperature: f
 
     try:
         data = json.loads(body)
-        return (
-            data.get("choices", [{}])[0]
-            .get("message", {})
-            .get("content", "")
-        )
+
+        # OpenAI-compatible shape: { choices: [ { message: { content: "..." } } ] }
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise RuntimeError("modelscope_empty_choices (服务返回空结果，可能是限流/鉴权/服务端异常)")
+
+        first = choices[0] if isinstance(choices[0], dict) else {}
+        msg = first.get("message") if isinstance(first, dict) else None
+        if not isinstance(msg, dict):
+            raise RuntimeError("modelscope_missing_message (响应格式变化或服务端异常)")
+
+        content = msg.get("content", "")
+        if content is None:
+            return ""
+        if not isinstance(content, str):
+            return str(content)
+        return content
+    except RuntimeError:
+        # Our own clear markers; keep as-is.
+        raise
     except Exception as e:  # noqa: BLE001
-        raise RuntimeError(f"modelscope_bad_response: {body[:400]}") from e
+        raise RuntimeError(f"modelscope_bad_response: {str(e)}; body={body[:400]}") from e
 
 
 _JSON_ARRAY_RE = re.compile(r"\[[\s\S]*\]", re.MULTILINE)

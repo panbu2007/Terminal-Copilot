@@ -20,6 +20,10 @@
       </div>
       <button id="reset" class="btn-export" title="清空本地缓存并创建新会话">新会话</button>
       <button id="llm" class="btn-export">LLM设置</button>
+      <div id="llmGuide" class="llm-guide hidden" role="note" aria-live="polite">
+        <span id="llmGuideText">请在 LLM设置 中配置 Token 以启用 AI 功能</span>
+        <button id="llmGuideOpen" type="button" class="llm-guide-btn">去配置</button>
+      </div>
       <button id="export" class="btn-export">导出回放</button>
       <div class="status" id="status">连接中…</div>
     </header>

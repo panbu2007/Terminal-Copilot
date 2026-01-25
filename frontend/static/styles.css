@@ -7,9 +7,12 @@
   --good: #37d67a;
   --warn: #f5c542;
   --bad: #ff5c7a;
+  --info: #8b5cf6;
 }
 
 * { box-sizing: border-box; }
+
+.hidden { display: none !important; }
 
 html,
 body {
@@ -48,6 +51,34 @@ body {
   margin-left: auto;
   color: var(--muted);
   font-size: 13px;
+}
+
+.llm-guide {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  border: 1px solid rgba(139, 92, 246, 0.35);
+  border-radius: 999px;
+  background: rgba(139, 92, 246, 0.14);
+  color: rgba(214, 198, 255, 0.96);
+  font-size: 12px;
+  line-height: 1.2;
+  max-width: 520px;
+}
+
+.llm-guide-btn {
+  border: 1px solid rgba(139, 92, 246, 0.35);
+  background: rgba(139, 92, 246, 0.14);
+  color: rgba(214, 198, 255, 0.96);
+  padding: 4px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+}
+
+.btn-attention {
+  border-color: rgba(139, 92, 246, 0.45) !important;
+  background: rgba(139, 92, 246, 0.10) !important;
 }
 
 .layout {

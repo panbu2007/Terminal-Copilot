@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 import shlex
@@ -42,6 +43,25 @@ FRONTEND_DIR = REPO_ROOT / "frontend"
 FRONTEND_STATIC_DIR = FRONTEND_DIR / "static"
 
 app = FastAPI(title="Terminal Copilot", version="0.1.0")
+
+logger = logging.getLogger("terminal_copilot")
+
+
+def _llm_token_configured() -> bool:
+    return has_modelscope_token() or bool(os.getenv("MODELSCOPE_ACCESS_TOKEN")) or bool(
+        os.getenv("TERMINAL_COPILOT_MODELSCOPE_ACCESS_TOKEN")
+    )
+
+
+@app.on_event("startup")
+def _startup_llm_guide() -> None:
+    if _llm_token_configured():
+        return
+    logger.warning(
+        "LLM 未配置 Token：请在页面右上角「LLM设置」中粘贴 Token 以启用 AI 功能；"
+        "或设置环境变量 MODELSCOPE_ACCESS_TOKEN / TERMINAL_COPILOT_MODELSCOPE_ACCESS_TOKEN。"
+    )
+    logger.warning("（本地保存路径：.secrets/modelscope_access_token.txt，已加入 gitignore）")
 
 
 def _is_running_in_container() -> bool:
@@ -123,9 +143,14 @@ def api_executor_set_mode(req: ExecutorModeRequest) -> ExecutorStatusResponse:
 @app.post("/api/sessions/new", response_model=SessionResponse)
 def api_new_session() -> SessionResponse:
     session = STORE.get_or_create(None)
+    # Initialize cwd early so the frontend can show it in the prompt.
+    local_root = Path(os.getenv("TERMINAL_COPILOT_LOCAL_ROOT", str(REPO_ROOT))).resolve()
+    if not session.cwd:
+        session.cwd = str(local_root)
     return SessionResponse(
         session_id=session.id,
         created_at=session.created_at.isoformat(),
+        cwd=session.cwd,
         steps=STORE.to_dict_steps(session),
     )
 
@@ -150,6 +175,7 @@ def api_get_session(session_id: str) -> SessionResponse:
     return SessionResponse(
         session_id=session.id,
         created_at=session.created_at.isoformat(),
+        cwd=session.cwd,
         steps=STORE.to_dict_steps(session),
     )
 
@@ -184,6 +210,7 @@ def api_export(session_id: str) -> ExportResponse:
     return ExportResponse(
         session_id=session.id,
         created_at=session.created_at.isoformat(),
+        cwd=session.cwd,
         steps=STORE.to_dict_steps(session),
         events=STORE.to_dict_events(session),
     )
@@ -243,9 +270,7 @@ def api_llm_status() -> LlmStatusResponse:
 
     enabled_flag = os.getenv("TERMINAL_COPILOT_LLM_ENABLED", "auto").strip().lower()
     enabled = enabled_flag in {"1", "true", "yes", "on"}
-    token_ok = has_modelscope_token() or bool(os.getenv("MODELSCOPE_ACCESS_TOKEN")) or bool(
-        os.getenv("TERMINAL_COPILOT_MODELSCOPE_ACCESS_TOKEN")
-    )
+    token_ok = _llm_token_configured()
     if enabled_flag == "auto":
         enabled = token_ok
 
@@ -533,6 +558,7 @@ def api_execute(req: ExecuteRequest) -> ExecuteResponse:
         stdout=result.stdout,
         stderr=result.stderr,
         executor=executor.name,
+        cwd=session.cwd,
         steps=STORE.to_dict_steps(session),
     )
 

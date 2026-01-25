@@ -8,6 +8,9 @@ const exportBtn = document.getElementById('export');
 const resetBtn = document.getElementById('reset');
 const llmBtn = document.getElementById('llm');
 const llmModal = document.getElementById('llmModal');
+const llmGuideEl = document.getElementById('llmGuide');
+const llmGuideTextEl = document.getElementById('llmGuideText');
+const llmGuideOpenBtn = document.getElementById('llmGuideOpen');
 const llmTokenInput = document.getElementById('llmTokenInput');
 const llmModelDropdown = document.getElementById('llmModelDropdown');
 const llmModelDropdownBtn = document.getElementById('llmModelDropdownBtn');
@@ -21,9 +24,170 @@ const executorSwitchEl = document.getElementById('executorSwitch');
 
 let currentExecutorMode = '';
 
+// cwd prompt
+let currentCwd = '';
+
+// Track what prompt prefix is currently rendered on the active input line.
+// Used to compute minimal overwrite lengths without clearing the whole line (reduces flicker).
+let lastRenderedPromptPrefix = '';
+
+// pending confirmation UI (avoid browser confirm popups)
+let pendingConfirmation = null;
+
+function formatCwdForPrompt(cwd) {
+  const s = String(cwd || '').trim();
+  if (!s) return '';
+  // Keep prompt compact; show tail when path is long.
+  if (s.length <= 48) return s;
+  return '…' + s.slice(-47);
+}
+
+function promptPrefix() {
+  const p = formatCwdForPrompt(currentCwd);
+  return p ? `${p}> ` : '> ';
+}
+
+function softRedrawPromptLine(nextLine, nextCursorPos = null) {
+  try {
+    const next = String(nextLine || '');
+    const nextPrompt = promptPrefix();
+    const pos = nextCursorPos === null ? next.length : Math.max(0, Math.min(Number(nextCursorPos) || 0, next.length));
+
+    const oldPrompt = String(lastRenderedPromptPrefix || nextPrompt);
+    const oldLine = String(currentLine || '');
+    const oldTotal = oldPrompt.length + oldLine.length;
+    const newTotal = nextPrompt.length + next.length;
+    const pad = Math.max(0, oldTotal - newTotal);
+
+    const back = pad + (next.length - pos);
+    let out = `\r${nextPrompt}${next}`;
+    if (pad > 0) out += ' '.repeat(pad);
+    if (back > 0) out += `\x1b[${back}D`;
+    term.write(out);
+
+    currentLine = next;
+    cursorPos = pos;
+    lastRenderedPromptPrefix = nextPrompt;
+  } catch {
+    // Fallback to full redraw if anything goes wrong.
+    const s = String(nextLine || '');
+    currentLine = s;
+    cursorPos = nextCursorPos === null ? s.length : Math.max(0, Math.min(Number(nextCursorPos) || 0, s.length));
+    refreshPrompt();
+  }
+}
+
+function refreshPrompt() {
+  try {
+    const line = String(currentLine || '');
+    const pos = Math.max(0, Math.min(cursorPos, line.length));
+    lastRenderedPromptPrefix = promptPrefix();
+    term.write('\x1b[2K\r');
+    term.write(`${lastRenderedPromptPrefix}${line}`);
+    const back = line.length - pos;
+    if (back > 0) term.write(`\x1b[${back}D`);
+    cursorPos = pos;
+  } catch {
+    // ignore
+  }
+}
+
+function clearPendingConfirmation() {
+  pendingConfirmation = null;
+  try {
+    const old = document.getElementById('pendingConfirmCard');
+    if (old) old.remove();
+  } catch {
+    // ignore
+  }
+}
+
+function renderPendingConfirmation() {
+  if (!suggestionsEl) return;
+  try {
+    const old = document.getElementById('pendingConfirmCard');
+    if (old) old.remove();
+  } catch {
+    // ignore
+  }
+  if (!pendingConfirmation) return;
+
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.id = 'pendingConfirmCard';
+
+  const title = document.createElement('div');
+  title.className = 'card-title';
+  title.innerHTML = `<span>需要二次确认</span><span class="badge warn">warn</span>`;
+  card.appendChild(title);
+
+  const cmd = document.createElement('div');
+  cmd.className = 'cmd';
+  cmd.textContent = String(pendingConfirmation.command || '');
+  card.appendChild(cmd);
+
+  const reason = String(pendingConfirmation.reason || '').trim();
+  if (reason) {
+    const explain = document.createElement('div');
+    explain.className = 'explain';
+    explain.textContent = `原因：${reason}`;
+    card.appendChild(explain);
+  }
+
+  const actions = document.createElement('div');
+  actions.className = 'actions';
+
+  const btnOk = document.createElement('button');
+  btnOk.className = 'primary';
+  btnOk.textContent = '确认执行';
+  btnOk.onclick = async () => {
+    const c = pendingConfirmation ? String(pendingConfirmation.command || '') : '';
+    clearPendingConfirmation();
+    if (!c) return;
+    await runCommand(c, true);
+  };
+
+  const btnCancel = document.createElement('button');
+  btnCancel.className = 'danger';
+  btnCancel.textContent = '取消';
+  btnCancel.onclick = () => {
+    clearPendingConfirmation();
+    writeInfoAbovePrompt('已取消执行。');
+  };
+
+  actions.appendChild(btnOk);
+  actions.appendChild(btnCancel);
+  card.appendChild(actions);
+
+  // Prepend to suggestions panel so it's always visible.
+  try {
+    suggestionsEl.prepend(card);
+  } catch {
+    suggestionsEl.appendChild(card);
+  }
+}
+
+function setPendingConfirmation(command, reason) {
+  pendingConfirmation = {
+    command: String(command || ''),
+    reason: String(reason || ''),
+    ts: Date.now(),
+  };
+  renderPendingConfirmation();
+}
+
 // Timeline (infinite UI)
 let timelineRounds = [];
 let lastSuggestionsCache = [];
+
+function newRoundId() {
+  try {
+    if (typeof crypto !== 'undefined' && crypto && crypto.randomUUID) return crypto.randomUUID();
+  } catch {
+    // ignore
+  }
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
 
 function timelineStorageKey() {
   const sid = getSessionId();
@@ -60,7 +224,13 @@ function clearTimeline() {
 
 function setStatusReady() {
   const mode = currentExecutorMode ? String(currentExecutorMode) : 'unknown';
-  statusEl.textContent = `就绪（executor=${mode}）`;
+  statusEl.textContent = isSuggesting ? `就绪（executor=${mode}，生成建议中…）` : `就绪（executor=${mode}）`;
+}
+
+function setLlmGuideVisible(visible, text) {
+  if (llmGuideEl) llmGuideEl.classList.toggle('hidden', !visible);
+  if (llmGuideTextEl && text) llmGuideTextEl.textContent = String(text);
+  if (llmBtn) llmBtn.classList.toggle('btn-attention', !!visible);
 }
 
 // Keep the last user-provided token on the client side.
@@ -113,11 +283,13 @@ function clearCachedLlmToken() {
   }
 }
 
-async function resetClientState({ clearToken = true, newSession = true } = {}) {
+async function resetClientState({ clearToken = true, newSession = true, refreshPrompt: shouldRefreshPrompt = true } = {}) {
+  // Clear timeline for the current session id *before* clearing it.
+  // Otherwise we'd end up clearing only the "nosession" key.
+  clearTimeline();
+
   clearSessionId();
   if (clearToken) clearCachedLlmToken();
-
-  clearTimeline();
 
   // Clear UI panels
   try {
@@ -130,7 +302,11 @@ async function resetClientState({ clearToken = true, newSession = true } = {}) {
 
   if (newSession) {
     try {
-      await apiNewSession();
+      const s = await apiNewSession();
+      if (s && typeof s.cwd === 'string') {
+        currentCwd = s.cwd;
+        if (shouldRefreshPrompt) refreshPrompt();
+      }
     } catch {
       // ignore
     }
@@ -301,8 +477,7 @@ async function runSuggestOnly(text) {
       sug.suggestions,
       (s) => {
         if (s.command === '(auto)') return;
-        term.write(s.command);
-        currentLine += s.command;
+        insertTextAtCursor(s.command);
       },
       async (s) => {
         if (MODE.get() !== 'assist') {
@@ -371,9 +546,11 @@ function downloadText(filename, text) {
 }
 
 function appendRound(round) {
-  timelineRounds.push(round);
+  const r = Object.assign({ rid: newRoundId() }, round || {});
+  timelineRounds.push(r);
   saveTimeline();
   renderTimeline();
+  return r.rid;
 }
 
 function updateLastRound(patch) {
@@ -382,6 +559,20 @@ function updateLastRound(patch) {
   Object.assign(r, patch || {});
   saveTimeline();
   renderTimeline();
+}
+
+function updateRoundById(rid, patch) {
+  if (!rid || !timelineRounds.length) return;
+  const id = String(rid);
+  for (let i = timelineRounds.length - 1; i >= 0; i--) {
+    const r = timelineRounds[i];
+    if (r && String(r.rid || '') === id) {
+      Object.assign(r, patch || {});
+      saveTimeline();
+      renderTimeline();
+      return;
+    }
+  }
 }
 
 function extractVerificationSteps(steps, cmd) {
@@ -436,7 +627,8 @@ function renderTimeline() {
     meta.className = 'round-meta';
     const mode = r.executor ? `executor=${r.executor}` : 'executor=?';
     const code = (typeof r.exit_code === 'number') ? `exit=${r.exit_code}` : '';
-    meta.textContent = `${formatTs(r.ts)}  ${mode}${code ? '  ' + code : ''}`;
+    const dur = (typeof r.total_ms === 'number' && r.total_ms >= 0) ? `  ${r.total_ms}ms` : '';
+    meta.textContent = `${formatTs(r.ts)}  ${mode}${code ? '  ' + code : ''}${dur}`;
 
     head.appendChild(title);
     head.appendChild(meta);
@@ -531,6 +723,31 @@ function renderTimeline() {
     }
     wrap.appendChild(stVer);
 
+    // Next
+    const stNext = document.createElement('div');
+    stNext.className = 'stage';
+    const stNextTitle = document.createElement('div');
+    stNextTitle.className = 'stage-title';
+    stNextTitle.textContent = '下一步';
+    stNext.appendChild(stNextTitle);
+
+    if (r.next && Array.isArray(r.next.items) && r.next.items.length > 0) {
+      for (const it of r.next.items.slice(0, 3)) {
+        const line = document.createElement('div');
+        line.className = 'explain';
+        const t = it && it.title ? String(it.title) : '';
+        const c = it && it.command ? String(it.command) : '';
+        line.textContent = t ? `建议：${t}${c ? '（' + c + '）' : ''}` : (c ? `建议：${c}` : '');
+        stNext.appendChild(line);
+      }
+    } else {
+      const line = document.createElement('div');
+      line.className = 'explain';
+      line.textContent = '（暂无下一步建议摘要）';
+      stNext.appendChild(line);
+    }
+    wrap.appendChild(stNext);
+
     stepsEl.appendChild(wrap);
   }
 
@@ -568,14 +785,25 @@ function badgeClass(level) {
 function renderSuggestions(suggestions, insertFn, executeFn) {
   clearSuggestions();
   lastSuggestionsCache = Array.isArray(suggestions) ? suggestions : [];
+
+  // Always show pending confirmation (if any) at top.
+  if (pendingConfirmation) {
+    renderPendingConfirmation();
+  }
+
   if (!suggestions || suggestions.length === 0) {
     suggestionsEl.innerHTML = '<div class="card"><div class="explain">暂无建议（继续输入命令或触发 Demo）</div></div>';
+    if (pendingConfirmation) renderPendingConfirmation();
     return;
   }
 
   setHint(suggestions[0].command && suggestions[0].command !== '(auto)' ? suggestions[0].command : '');
 
   for (const s of suggestions) {
+    const cmdText = (s && typeof s.command === 'string') ? s.command : String(s.command || '');
+    const tags = (s && Array.isArray(s.tags)) ? s.tags.map(String) : [];
+    const isNonExecutable = !cmdText || cmdText === '(auto)' || tags.includes('error') || tags.includes('status');
+
     const card = document.createElement('div');
     card.className = 'card';
 
@@ -587,7 +815,7 @@ function renderSuggestions(suggestions, insertFn, executeFn) {
 
     const cmd = document.createElement('div');
     cmd.className = 'cmd';
-    cmd.textContent = s.command;
+    cmd.textContent = cmdText;
 
     const explain = document.createElement('div');
     explain.className = 'explain';
@@ -604,18 +832,19 @@ function renderSuggestions(suggestions, insertFn, executeFn) {
 
     const actions = document.createElement('div');
     actions.className = 'actions';
+    if (!isNonExecutable) {
+      const btnInsert = document.createElement('button');
+      btnInsert.textContent = '插入到终端';
+      btnInsert.onclick = () => insertFn(s);
 
-    const btnInsert = document.createElement('button');
-    btnInsert.textContent = '插入到终端';
-    btnInsert.onclick = () => insertFn(s);
+      const btnExec = document.createElement('button');
+      btnExec.textContent = '执行';
+      btnExec.className = 'primary';
+      btnExec.onclick = () => executeFn(s);
 
-    const btnExec = document.createElement('button');
-    btnExec.textContent = '执行';
-    btnExec.className = 'primary';
-    btnExec.onclick = () => executeFn(s);
-
-    actions.appendChild(btnInsert);
-    actions.appendChild(btnExec);
+      actions.appendChild(btnInsert);
+      actions.appendChild(btnExec);
+    }
 
       card.appendChild(title);
       card.appendChild(cmd);
@@ -630,12 +859,13 @@ function renderSuggestions(suggestions, insertFn, executeFn) {
         for (const c of s.citations.slice(0, 3)) {
           const cite = document.createElement('div');
           cite.className = 'explain';
-          cite.textContent = `依据：${c.title} — ${c.snippet}`;
+          const src = c && c.source ? `（${c.source}）` : '';
+          cite.textContent = `依据：${c.title}${src} — ${c.snippet}`;
           card.appendChild(cite);
         }
       }
 
-      card.appendChild(actions);
+      if (!isNonExecutable) card.appendChild(actions);
 
     suggestionsEl.appendChild(card);
   }
@@ -684,18 +914,43 @@ try {
 }
 
 let currentLine = '';
-const PROMPT = '> ';
+let cursorPos = 0;
+
+// Cache the latest LLM status line so we can re-print it after clearing the terminal
+// (e.g., when creating a new session).
+let lastLlmStatusLine = '';
 
 let isExecuting = false;
+
+let isSuggesting = false;
+let suggestToken = 0;
 
 const history = [];
 let historyIndex = 0;
 
 function redrawPromptLine(nextLine) {
   const s = String(nextLine || '');
-  currentLine = s;
-  term.write('\x1b[2K\r');
-  term.write(`${PROMPT}${s}`);
+  softRedrawPromptLine(s, s.length);
+}
+
+function insertTextAtCursor(text) {
+  const t = String(text || '');
+  if (!t) return;
+
+  // Fast path: appending at end (most common typing case) — avoid full redraw.
+  if (cursorPos === currentLine.length) {
+    currentLine += t;
+    cursorPos += t.length;
+    term.write(t);
+    return;
+  }
+
+  const pos = Math.max(0, Math.min(cursorPos, currentLine.length));
+  const before = currentLine.slice(0, pos);
+  const after = currentLine.slice(pos);
+  currentLine = before + t + after;
+  cursorPos = pos + t.length;
+  refreshPrompt();
 }
 
 function pushHistory(cmd) {
@@ -720,11 +975,20 @@ function historyDown() {
 }
 
 function prompt() {
-  term.write(`\r\n${PROMPT}`);
+  lastRenderedPromptPrefix = promptPrefix();
+  term.write(`\r\n${lastRenderedPromptPrefix}`);
   currentLine = '';
+  cursorPos = 0;
 }
 
 function clearTerminalUi() {
+  // Use a strong reset (RIS) to avoid any leftover prompt/path prefix being
+  // stuck on the same line as the banner after clearing.
+  try {
+    term.write('\x1bc');
+  } catch {
+    // ignore
+  }
   try {
     term.reset();
   } catch {
@@ -734,8 +998,11 @@ function clearTerminalUi() {
       // ignore
     }
   }
+
   term.write('Terminal Copilot (MVP)');
+  if (lastLlmStatusLine) term.write(`\r\n\x1b[36m${lastLlmStatusLine}\x1b[0m`);
   currentLine = '';
+  cursorPos = 0;
 }
 function writeError(msg) {
   term.write(`\r\n\x1b[31m${msg}\x1b[0m`);
@@ -748,16 +1015,41 @@ function writeInfo(msg) {
 function writeInfoAbovePrompt(msg) {
   // Print an info line above the current prompt, without leaving the cursor after the info.
   const typed = currentLine;
+  const pos = cursorPos;
+  lastRenderedPromptPrefix = promptPrefix();
   term.write('\x1b[2K\r');
-  term.write(`\x1b[36m${msg}\x1b[0m\r\n${PROMPT}${typed}`);
+  term.write(`\x1b[36m${msg}\x1b[0m\r\n${lastRenderedPromptPrefix}${typed}`);
   currentLine = typed;
+  cursorPos = Math.max(0, Math.min(pos, typed.length));
+  const back = typed.length - cursorPos;
+  if (back > 0) term.write(`\x1b[${back}D`);
 }
 
 async function runCommand(cmd, confirmed = false) {
+  let prompted = false;
   try {
     statusEl.textContent = '执行中…';
     isExecuting = true;
+
+    // If the command wasn't typed in the terminal (e.g. clicked from suggestions),
+    // echo it on the current prompt line so users can see what is being executed.
+    try {
+      const shown = String(currentLine || '');
+      const target = String(cmd || '');
+      if (target && shown !== target) {
+        redrawPromptLine(target);
+      }
+    } catch {
+      // ignore
+    }
+
+    const t0 = Date.now();
     const execRes = await apiExecute(cmd, confirmed);
+
+    if (execRes && typeof execRes.cwd === 'string') {
+      currentCwd = execRes.cwd;
+      refreshPrompt();
+    }
 
     // Best-effort sync current executor (backend returns executor name per run).
     if (execRes && execRes.executor) {
@@ -771,7 +1063,7 @@ async function runCommand(cmd, confirmed = false) {
     }
 
     // Append a new timeline round immediately after execution.
-    appendRound({
+    const rid = appendRound({
       ts: Date.now(),
       command: cmd,
       executor: execRes && execRes.executor ? String(execRes.executor) : '',
@@ -779,6 +1071,8 @@ async function runCommand(cmd, confirmed = false) {
       stdout: execRes.stdout || '',
       stderr: execRes.stderr || '',
       verify_steps: extractVerificationSteps(execRes.steps, cmd),
+      exec_ms: Date.now() - t0,
+      total_ms: null,
       plan: (() => {
         try {
           const m = (lastSuggestionsCache || []).find((x) => x && x.command === cmd);
@@ -787,6 +1081,7 @@ async function runCommand(cmd, confirmed = false) {
           return null;
         }
       })(),
+      next: { items: [] },
     });
 
     const lastStep = Array.isArray(execRes.steps) && execRes.steps.length > 0 ? execRes.steps[execRes.steps.length - 1] : null;
@@ -794,16 +1089,11 @@ async function runCommand(cmd, confirmed = false) {
 
     if (execRes.stderr === 'confirmation_required' && !confirmed) {
       const reason = findLastPolicyDetail(execRes.steps, ['需要确认']) || lastDetail;
-      if (MODE.get() !== 'assist') {
-        writeInfo('该命令需要二次确认；切换到「建议+执行」模式后可继续。');
-        if (reason) writeInfo(`原因：${reason}`);
-        setStatusReady();
-        return;
-      }
-      const ok = confirm(`该命令需要二次确认：\n\n${cmd}\n\n原因：${reason || '潜在影响较大'}\n\n确认执行？`);
-      if (ok) {
-        await runCommand(cmd, true);
-      }
+      setPendingConfirmation(cmd, reason || '潜在影响较大');
+      writeInfoAbovePrompt('该命令需要二次确认：请在右侧点击「确认执行」或「取消」。');
+      setStatusReady();
+      prompt();
+      prompted = true;
       return;
     }
     if (execRes.stderr === 'blocked_by_policy') {
@@ -811,6 +1101,8 @@ async function runCommand(cmd, confirmed = false) {
       writeError('该命令被安全策略拦截（block）。');
       if (reason) writeError(`原因：${reason}`);
       setStatusReady();
+      prompt();
+      prompted = true;
       return;
     }
     const MAX_TERM_CHARS = 8000;
@@ -825,71 +1117,166 @@ async function runCommand(cmd, confirmed = false) {
       term.write(`\r\n\x1b[31m${shown.replaceAll('\n', '\r\n')}\x1b[0m`);
     }
 
-    const sug = await apiSuggest({
-      command: cmd,
-      exit_code: execRes.exit_code,
-      stdout: execRes.stdout,
-      stderr: execRes.stderr,
-    });
-
-    // Update the last round with any verify step appended after suggest (planned steps are not verification).
-    updateLastRound({
-      verify_steps: extractVerificationSteps(sug.steps, cmd),
-    });
-
-    renderSuggestions(
-      sug.suggestions,
-      (s) => {
-        if (s.command === '(auto)') return;
-        term.write(s.command);
-        currentLine += s.command;
-      },
-      async (s) => {
-        if (MODE.get() !== 'assist') {
-          writeInfo('当前为「只建议」模式，切换到「建议+执行」即可一键执行。');
-          return;
-        }
-        if (s.risk_level === 'block') {
-          writeError('该命令被安全策略拦截（block）。');
-          return;
-        }
-        if (s.requires_confirmation) {
-          const ok = confirm(`该操作风险等级为 warn：\n\n${s.command}\n\n确认执行？`);
-          if (!ok) return;
-          await runCommand(s.command, true);
-          return;
-        }
-        await runCommand(s.command, false);
-      }
-    );
-
+    // Do NOT block the prompt on suggestions generation.
     setStatusReady();
+    prompt();
+    prompted = true;
+    isExecuting = false;
+
+    const token = ++suggestToken;
+    isSuggesting = true;
+    setStatusReady();
+    void (async () => {
+      try {
+        const sug = await apiSuggest({
+          command: cmd,
+          exit_code: execRes.exit_code,
+          stdout: execRes.stdout,
+          stderr: execRes.stderr,
+        });
+
+        // Update the correct round even if user already ran another command.
+        updateRoundById(rid, {
+          verify_steps: extractVerificationSteps(sug.steps, cmd),
+          total_ms: Date.now() - t0,
+          next: {
+            items: Array.isArray(sug.suggestions)
+              ? sug.suggestions
+                  .filter((x) => x && x.command && x.command !== '(auto)')
+                  .slice(0, 5)
+                  .map((x) => ({ title: x.title, command: x.command, agent: x.agent }))
+              : [],
+          },
+        });
+
+        renderSuggestions(
+          sug.suggestions,
+          (s) => {
+            if (s.command === '(auto)') return;
+            insertTextAtCursor(s.command);
+          },
+          async (s) => {
+            if (MODE.get() !== 'assist') {
+              writeInfo('当前为「只建议」模式，切换到「建议+执行」即可一键执行。');
+              return;
+            }
+            if (s.risk_level === 'block') {
+              writeError('该命令被安全策略拦截（block）。');
+              return;
+            }
+            if (s.requires_confirmation) {
+              setPendingConfirmation(s.command, '风险等级为 warn（可能影响系统/数据），建议确认后再执行。');
+              writeInfoAbovePrompt('该建议需要确认：请在右侧点击「确认执行」。');
+              return;
+            }
+            await runCommand(s.command, false);
+          }
+        );
+      } catch (e) {
+        try {
+          clearSuggestions();
+          suggestionsEl.innerHTML = `<div class="card"><div class="explain">建议生成失败：${escapeHtml(String(e.message || e))}</div></div>`;
+        } catch {
+          // ignore
+        }
+      } finally {
+        if (token === suggestToken) {
+          isSuggesting = false;
+          setStatusReady();
+        }
+      }
+    })();
+    return;
   } catch (e) {
     statusEl.textContent = '错误';
     writeError(String(e.message || e));
   } finally {
     isExecuting = false;
-    prompt();
+    if (!prompted) prompt();
   }
 }
 
 term.write('Terminal Copilot (MVP)');
 prompt();
 
-// Try restore timeline for current session (local dev refresh behavior)
-loadTimeline();
+// On browser refresh, do NOT restore the previous task flow/timeline.
+// Users expect a clean slate after reload.
+try {
+  const nav = performance && performance.getEntriesByType
+    ? performance.getEntriesByType('navigation')[0]
+    : null;
+  const isReload = nav && nav.type === 'reload';
+  if (isReload) {
+    clearTimeline();
+  } else {
+    // Try restore timeline for current session (non-reload navigation).
+    loadTimeline();
+  }
+} catch {
+  // ignore
+}
 renderTimeline();
 
 (async () => {
   try {
+    // Ensure we have a session and sync cwd for prompt.
+    let sid = getSessionId();
+    if (!sid) {
+      const s = await apiNewSession();
+      if (s && typeof s.cwd === 'string') {
+        currentCwd = s.cwd;
+        refreshPrompt();
+      }
+    } else {
+      // best-effort: keep existing session, but if server restarted, create a new one.
+      try {
+        const res = await fetch(`/api/sessions/${sid}`);
+        if (res.ok) {
+          const s = await res.json();
+          if (s && typeof s.cwd === 'string') {
+            currentCwd = s.cwd;
+            refreshPrompt();
+          }
+        } else {
+          const s = await apiNewSession();
+          if (s && typeof s.cwd === 'string') {
+            currentCwd = s.cwd;
+            refreshPrompt();
+          }
+        }
+      } catch {
+        const s = await apiNewSession();
+        if (s && typeof s.cwd === 'string') {
+          currentCwd = s.cwd;
+          refreshPrompt();
+        }
+      }
+    }
+
     const st = await apiLlmStatus();
     const on = st.enabled ? 'ON' : 'OFF';
     const token = st.has_token ? '已配置' : '未配置';
-    writeInfoAbovePrompt(`LLM(${st.provider})=${on}，Token=${token}，Model=${st.model}`);
+    lastLlmStatusLine = `LLM(${st.provider})=${on}，Token=${token}，Model=${st.model}`;
+    writeInfoAbovePrompt(lastLlmStatusLine);
+
+    if (!st.has_token) {
+      setLlmGuideVisible(true, '未配置 Token：请在「LLM设置」中配置 Token 以启用 AI 功能');
+      writeInfoAbovePrompt('提示：请在右上角「LLM设置」中配置 Token 以启用 AI 建议功能。');
+    } else {
+      setLlmGuideVisible(false);
+    }
   } catch (e) {
     // ignore
   }
 })();
+
+if (llmGuideOpenBtn) {
+  llmGuideOpenBtn.addEventListener('click', (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    openLlmModal();
+  });
+}
 
 function openLlmModal() {
   if (!llmModal) return;
@@ -988,6 +1375,7 @@ async function saveLlmTokenFromModal() {
 
     const st = await apiLlmStatus();
     writeInfo(`Token 已保存。LLM=${st.enabled ? 'ON' : 'OFF'}，Model=${st.model}`);
+    if (st.has_token) setLlmGuideVisible(false);
     setStatusReady();
     closeLlmModal();
   } catch (e) {
@@ -1168,6 +1556,50 @@ term.onData(async (data) => {
     return;
   }
 
+  // Left/Right/Home/End
+  if (data === '\x1b[D') {
+    if (cursorPos > 0) {
+      cursorPos -= 1;
+      term.write('\x1b[D');
+    }
+    return;
+  }
+  if (data === '\x1b[C') {
+    if (cursorPos < currentLine.length) {
+      cursorPos += 1;
+      term.write('\x1b[C');
+    }
+    return;
+  }
+  // Delete (forward delete)
+  if (data === '\x1b[3~') {
+    if (cursorPos < currentLine.length) {
+      const before = currentLine.slice(0, cursorPos);
+      const after = currentLine.slice(cursorPos + 1);
+      currentLine = before + after;
+      // Incremental update from cursor to end (avoid full redraw flicker).
+      try {
+        term.write('\x1b[s');
+        term.write(after + ' ');
+        term.write('\x1b[u');
+      } catch {
+        refreshPrompt();
+      }
+    }
+    return;
+  }
+  if (data === '\x1b[H' || data === '\x1b[1~') {
+    if (cursorPos > 0) term.write(`\x1b[${cursorPos}D`);
+    cursorPos = 0;
+    return;
+  }
+  if (data === '\x1b[F' || data === '\x1b[4~') {
+    const delta = currentLine.length - cursorPos;
+    if (delta > 0) term.write(`\x1b[${delta}C`);
+    cursorPos = currentLine.length;
+    return;
+  }
+
   // Enter
   if (data === '\r') {
     const cmd = currentLine.trim();
@@ -1186,9 +1618,19 @@ term.onData(async (data) => {
 
   // Backspace
   if (data === '\u007f') {
-    if (currentLine.length > 0) {
-      currentLine = currentLine.slice(0, -1);
-      term.write('\b \b');
+    if (cursorPos > 0 && currentLine.length > 0) {
+      if (cursorPos === currentLine.length) {
+        // Fast path: delete last char without full redraw.
+        currentLine = currentLine.slice(0, -1);
+        cursorPos -= 1;
+        term.write('\b \b');
+      } else {
+        const before = currentLine.slice(0, cursorPos - 1);
+        const after = currentLine.slice(cursorPos);
+        currentLine = before + after;
+        cursorPos -= 1;
+        refreshPrompt();
+      }
     }
     return;
   }
@@ -1199,16 +1641,14 @@ term.onData(async (data) => {
     const m = text.match(/^Tab 接受：(.+)$/);
     if (m && m[1]) {
       const toInsert = m[1];
-      term.write(toInsert);
-      currentLine += toInsert;
+      insertTextAtCursor(toInsert);
     }
     return;
   }
 
   // Printable
   if (data >= ' ' && data !== '\x7f') {
-    currentLine += data;
-    term.write(data);
+    insertTextAtCursor(data);
   }
 });
 
@@ -1235,8 +1675,11 @@ if (executorSwitchEl) {
       statusEl.textContent = '错误';
       writeError(String(e.message || e));
       await refreshExecutorStatus({ updateReadyText: false });
-    } finally {
       prompt();
+      return;
+    } finally {
+      // writeInfoAbovePrompt already redraws the prompt; avoid adding an extra prompt line.
+      refreshPrompt();
     }
   });
 }
@@ -1274,9 +1717,8 @@ if (resetBtn) {
       if (!ok) return;
       statusEl.textContent = '重置中…';
       // Keep the LLM token in sessionStorage; only reset session/timeline/UI.
-      await resetClientState({ clearToken: false, newSession: true });
+      await resetClientState({ clearToken: false, newSession: true, refreshPrompt: false });
       clearTerminalUi();
-      writeInfoAbovePrompt('已创建新会话（保留本地 LLM Token）');
       setStatusReady();
     } catch (e) {
       statusEl.textContent = '错误';
