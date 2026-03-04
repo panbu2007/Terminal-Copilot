@@ -19,6 +19,14 @@ This file provides repository-specific instructions for coding agents working in
 - Dependencies are minimal and Python-only: `fastapi`, `uvicorn[standard]`, `pydantic`.
 - There is no Node.js toolchain in the repo.
 - There are currently no automated tests in the project.
+- Current UI already includes:
+  - execution plan graph rendering with D3 + dagre
+  - live SSE plan streaming
+  - multi-agent collaboration panel
+  - audit report panel with export
+  - suggestion confidence badges
+  - onboarding demo buttons
+  - runbook management modal
 
 ## Run And Verify
 
@@ -35,6 +43,27 @@ When making changes, prefer the smallest verification that proves the modified p
 - Frontend-only changes: verify the page still loads from FastAPI and the edited interaction still works.
 - API contract changes: inspect corresponding Pydantic models in `backend/app/models.py` and confirm frontend call sites in `frontend/static/app.js`.
 
+## Deployment Notes
+
+- Current Linux deployment target:
+  - host: `root@47.100.65.191`
+  - app dir: `/opt/terminal_copilot`
+  - service: `terminal-copilot`
+  - venv: `/opt/terminal_copilot/.venv`
+  - bind: `0.0.0.0:8000`
+- Server runtime should use Python `3.11+`. The stock system `python3` may be too old for Pydantic v2.
+- Production health check:
+  - local on server: `curl http://127.0.0.1:8000/api/health`
+  - expected PTY-capable Linux result includes `"pty_supported":"1"`
+- Preferred server operations:
+  - status: `systemctl status terminal-copilot --no-pager`
+  - logs: `journalctl -u terminal-copilot -n 200 --no-pager`
+  - restart: `systemctl restart terminal-copilot`
+- Keep server-side secrets under `/opt/terminal_copilot/.secrets/`. Never commit `.secrets/` contents.
+- If you update deployment-critical code, verify both:
+  - HTTP health endpoint
+  - PTY WebSocket path `/ws/terminal/{session_id}` on Linux
+
 ## Architecture Facts
 
 ### Backend
@@ -49,6 +78,7 @@ When making changes, prefer the smallest verification that proves the modified p
 - `backend/app/verifier.py` performs post-execution verification for specific scenarios.
 - `backend/app/store.py` is an in-memory session/event store.
 - `backend/app/plan_executor.py` manages DAG plan execution and active plan state in memory.
+- `backend/app/plan_executor.py` also emits SSE events for node lifecycle, stdout chunks, approval waits, and final audit reports.
 - `backend/app/rag.py` indexes `docs/runbook/*.md` with cached loading.
 - `backend/app/rag_v2.py` exists for vector retrieval support, but do not assume every request path uses it directly.
 - `backend/app/local_secrets.py` persists local token/config state under `.secrets/`.
@@ -66,9 +96,10 @@ When making changes, prefer the smallest verification that proves the modified p
 
 ### Frontend
 
-- `frontend/static/app.js` is a large vanilla JS file containing terminal UX, suggestion rendering, timeline behavior, and plan streaming logic.
+- `frontend/static/app.js` is a large vanilla JS file containing terminal UX, suggestion rendering, timeline behavior, plan graph rendering, agent progress streaming, audit rendering, and runbook management.
 - There is no frontend build step, bundler, or component framework. Edit source files directly.
 - Keep browser-side changes incremental and avoid large rewrites unless explicitly requested.
+- `frontend/index.html` already loads D3 and dagre from CDN. Do not add a second graph stack unless explicitly needed.
 
 ### Knowledge Base
 
@@ -90,7 +121,7 @@ When making changes, prefer the smallest verification that proves the modified p
   - `policy.py`
   - `verifier.py`
   - `backend/app/executor/*`
-- When changing plan-generation or streaming behavior, also inspect the frontend plan/timeline handling in `frontend/static/app.js`.
+- When changing plan-generation or streaming behavior, also inspect the frontend plan graph, node popover, audit panel, and agent/timeline handling in `frontend/static/app.js`.
 - When changing models or endpoint payloads, update both backend models and frontend request/response handling in the same task.
 - Avoid introducing new dependencies unless the task clearly requires them.
 - Avoid adding a frontend build system, framework migration, or large state-management layer unless explicitly requested.
@@ -117,11 +148,25 @@ When making changes, prefer the smallest verification that proves the modified p
 - Preserve fallback behavior when LLM/token-dependent paths are unavailable.
 - Do not assume the orchestrator is always used; rule-based suggestions still matter.
 
+### Changing Plan Execution UX
+
+- Keep `/api/plan/{id}/stream` events compatible with `PlanStreamClient`.
+- Preserve node detail behavior:
+  - approval
+  - skip
+  - live stdout display
+- If you add new event types, update both backend emitters and frontend consumers in the same change.
+
 ### Editing Runbook Content
 
 - Put new knowledge under `docs/runbook/`.
 - Keep filenames stable and markdown-based.
 - Remember that retrieval caches may need a restart.
+
+## Deliverable Boundaries
+
+- Repository-contained deliverables are documented in `docs/2026-03-04-final-iteration-deliverables.md`.
+- Non-repository competition assets such as final video, poster export, and external article submission content should be treated as separate deliverables, not assumed to exist in code.
 
 ## Environment And Secrets
 
