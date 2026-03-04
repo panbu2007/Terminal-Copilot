@@ -56,6 +56,7 @@ from .plan_executor import (
     approve_node,
     cancel_plan,
     get_plan_state,
+    skip_node,
     start_plan_execution,
 )
 from .planner import build_execution_plan, suggest
@@ -1165,6 +1166,12 @@ async def api_plan_stream(
 @app.post("/api/plan/{plan_id}/node/{node_id}/approve")
 def api_plan_node_approve(plan_id: str, node_id: str) -> dict:
     ok = approve_node(plan_id, node_id)
+    return {"ok": ok}
+
+
+@app.post("/api/plan/{plan_id}/node/{node_id}/skip")
+def api_plan_node_skip(plan_id: str, node_id: str) -> dict:
+    ok = skip_node(plan_id, node_id)
     return {"ok": ok}
 
 

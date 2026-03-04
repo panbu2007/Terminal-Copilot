@@ -669,6 +669,21 @@ body {
   color: var(--muted);
 }
 
+.node-popover-output {
+  margin: 8px 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.34);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  color: #dbe4ff;
+  font-size: 11px;
+  line-height: 1.45;
+  max-height: 180px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 /* ── Audit Report UI ────────────────────────────────── */
 .audit-content {
   display: flex;

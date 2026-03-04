@@ -3,10 +3,10 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from queue import Queue
 from typing import Any
 
+from .agents.safety_agent import SafetyAgent
 from .executor import get_executor
 from .models import ExecutionPlan, PlanNode
 
@@ -23,10 +23,12 @@ class PlanExecutionState:
     node_outputs: dict[str, dict] = field(default_factory=dict)
     event_queue: Queue = field(default_factory=Queue)
     approve_events: dict[str, threading.Event] = field(default_factory=dict)
+    skipped_by_user: set[str] = field(default_factory=set)
     cancel_event: threading.Event = field(default_factory=threading.Event)
 
 
 _ACTIVE_PLANS: dict[str, PlanExecutionState] = {}
+_AUDITOR = SafetyAgent()
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
@@ -55,6 +57,18 @@ def approve_node(plan_id: str, node_id: str) -> bool:
     ev = state.approve_events.get(node_id)
     if ev is None:
         return False
+    ev.set()
+    return True
+
+
+def skip_node(plan_id: str, node_id: str) -> bool:
+    state = _ACTIVE_PLANS.get(plan_id)
+    if state is None:
+        return False
+    ev = state.approve_events.get(node_id)
+    if ev is None:
+        return False
+    state.skipped_by_user.add(node_id)
     ev.set()
     return True
 
@@ -152,6 +166,8 @@ def _execute_plan(state: PlanExecutionState) -> None:  # noqa: C901
             "title": n.title if n else nid,
             "status": ns,
             "risk_level": n.risk_level if n else "safe",
+            "grounded": bool(n.grounded) if n else False,
+            "type": n.type if n else "command",
             "output": state.node_outputs.get(nid, {}),
         })
 
@@ -165,6 +181,7 @@ def _execute_plan(state: PlanExecutionState) -> None:  # noqa: C901
         "skipped": skipped,
         "nodes": node_report,
     }
+    report["analysis"] = _AUDITOR.summarize_execution_audit(report)
     _emit(state, {"type": "audit_complete", "report": report})
     _emit(state, {"type": "plan_done", "summary": overall})
     _emit(state, None)  # sentinel
@@ -219,6 +236,10 @@ def _execute_node(state: PlanExecutionState, node: PlanNode) -> str:
             approved = ev.wait(timeout=300.0)
 
         if state.cancel_event.is_set():
+            return "skipped"
+
+        if nid in state.skipped_by_user:
+            _emit(state, {"type": "node_skipped", "node_id": nid, "reason": "skipped_by_user"})
             return "skipped"
 
         if not approved:

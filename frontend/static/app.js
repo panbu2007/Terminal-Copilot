@@ -285,6 +285,9 @@ let currentAuditReport = null;
 let currentSuggestStream = null;
 let currentPlanStream = null;
 let latestRunbookItems = [];
+let currentPlanNodeOutputs = {};
+let currentPlanNodeStatuses = {};
+let currentPopoverNodeId = '';
 
 function initAgentState() {
   for (const item of AGENT_META) {
@@ -475,7 +478,7 @@ class PlanGraphRenderer {
         { x: to.x - to.width / 2, y: to.y },
       ];
       const line = d3.line().x((d) => d.x).y((d) => d.y).curve(d3.curveBasis);
-      group.append('path')
+      const path = group.append('path')
         .attr('class', `plan-edge ${edge.condition === 'failure' ? 'edge-failure' : edge.condition === 'always' ? 'edge-always' : 'edge-success'}`)
         .attr('d', line(points))
         .attr('marker-end', 'url(#planArrow)');
@@ -495,7 +498,7 @@ class PlanGraphRenderer {
           .attr('text-anchor', 'middle')
           .text(edge.label || edge.condition);
       }
-      this.edgeEls.push({ source: edge.source_id, target: edge.target_id, el: group });
+      this.edgeEls.push({ source: edge.source_id, target: edge.target_id, condition: edge.condition || 'success', path, el: group });
     }
 
     for (const node of plan.nodes) {
@@ -597,6 +600,24 @@ class PlanGraphRenderer {
                 : '○'
     );
   }
+
+  resetEdgeStates() {
+    for (const edge of this.edgeEls) {
+      if (!edge || !edge.path) continue;
+      edge.path.classed('edge-active', false).classed('edge-failed', false).classed('edge-flowing', false);
+    }
+  }
+
+  highlightEdgesFrom(nodeId, mode = 'active') {
+    const normalized = String(mode || 'active');
+    for (const edge of this.edgeEls) {
+      if (!edge || !edge.path || edge.source !== nodeId) continue;
+      edge.path
+        .classed('edge-active', normalized === 'active')
+        .classed('edge-flowing', normalized === 'active')
+        .classed('edge-failed', normalized === 'failed');
+    }
+  }
 }
 
 class PlanStreamClient {
@@ -626,21 +647,51 @@ class PlanStreamClient {
     if (!payload || !payload.type) return;
     if (payload.type === 'heartbeat') return;
     if (payload.type === 'node_start') {
+      currentPlanNodeStatuses[payload.node_id] = 'running';
       this.renderer.updateNodeStatus(payload.node_id, 'running');
+      this.renderer.resetEdgeStates();
+      this.renderer.highlightEdgesFrom(payload.node_id, 'active');
       switchSidePanel('plan');
       setPlanUnread(false);
       return;
     }
+    if (payload.type === 'node_stdout') {
+      appendNodeStdout(payload.node_id, payload.chunk || '');
+      if (currentPopoverNodeId === payload.node_id) {
+        const node = getCurrentPlanNode(payload.node_id);
+        if (node) openNodePopover(node, null, false);
+      }
+      return;
+    }
     if (payload.type === 'node_done') {
+      currentPlanNodeStatuses[payload.node_id] = payload.status || 'passed';
+      mergeNodeOutput(payload.node_id, {
+        stdout: payload.stdout,
+        stderr: payload.stderr,
+        exit_code: payload.exit_code,
+      });
       this.renderer.updateNodeStatus(payload.node_id, payload.status || 'passed');
+      this.renderer.resetEdgeStates();
+      this.renderer.highlightEdgesFrom(payload.node_id, payload.status === 'failed' ? 'failed' : 'active');
+      if (currentPopoverNodeId === payload.node_id) {
+        const node = getCurrentPlanNode(payload.node_id);
+        if (node) openNodePopover(node, null, false);
+      }
       if (payload.status === 'failed') switchSidePanel('audit');
       return;
     }
     if (payload.type === 'node_skipped') {
+      currentPlanNodeStatuses[payload.node_id] = 'skipped';
       this.renderer.updateNodeStatus(payload.node_id, 'skipped');
+      this.renderer.resetEdgeStates();
+      if (currentPopoverNodeId === payload.node_id) {
+        const node = getCurrentPlanNode(payload.node_id);
+        if (node) openNodePopover(node, null, false);
+      }
       return;
     }
     if (payload.type === 'need_approval') {
+      currentPlanNodeStatuses[payload.node_id] = 'awaiting_approval';
       this.renderer.updateNodeStatus(payload.node_id, 'awaiting_approval');
       const node = currentPlan && Array.isArray(currentPlan.nodes) ? currentPlan.nodes.find((item) => item.id === payload.node_id) : null;
       if (node) openNodePopover(node, null, true);
@@ -669,6 +720,32 @@ class PlanStreamClient {
 
 const planRenderer = new PlanGraphRenderer(planGraphEl);
 
+function getCurrentPlanNode(nodeId) {
+  if (!currentPlan || !Array.isArray(currentPlan.nodes)) return null;
+  return currentPlan.nodes.find((node) => node.id === nodeId) || null;
+}
+
+function getNodeOutputState(nodeId) {
+  return currentPlanNodeOutputs[nodeId] || { stdout: '', stderr: '', exit_code: null };
+}
+
+function mergeNodeOutput(nodeId, next) {
+  const prev = getNodeOutputState(nodeId);
+  currentPlanNodeOutputs[nodeId] = {
+    stdout: typeof next.stdout === 'string' ? next.stdout : prev.stdout,
+    stderr: typeof next.stderr === 'string' ? next.stderr : prev.stderr,
+    exit_code: next.exit_code === undefined ? prev.exit_code : next.exit_code,
+  };
+}
+
+function appendNodeStdout(nodeId, chunk) {
+  const prev = getNodeOutputState(nodeId);
+  currentPlanNodeOutputs[nodeId] = {
+    ...prev,
+    stdout: `${prev.stdout || ''}${String(chunk || '')}`,
+  };
+}
+
 function renderAuditReport(report) {
   currentAuditReport = report || null;
   if (!auditContentEl) return;
@@ -694,6 +771,43 @@ function renderAuditReport(report) {
   meta.innerHTML = `<div class="card-title"><span>Intent</span><span class="badge">${escapeHtml(report.plan_id || '')}</span></div><div class="explain">${escapeHtml(report.intent || '')}</div>`;
   auditContentEl.appendChild(meta);
 
+  const analysis = report.analysis || null;
+  if (analysis) {
+    const summary = document.createElement('div');
+    summary.className = `audit-finding severity-${analysis.severity === 'fail' ? 'fail' : analysis.severity === 'warn' ? 'warn' : 'info'}`;
+    summary.innerHTML = `
+      <div class="audit-finding-header">Safety Analysis</div>
+      <div class="audit-finding-msg">${escapeHtml(String(analysis.summary || ''))}</div>
+    `;
+    auditContentEl.appendChild(summary);
+
+    if (Array.isArray(analysis.findings) && analysis.findings.length) {
+      const findingsTitle = document.createElement('div');
+      findingsTitle.className = 'audit-section-title';
+      findingsTitle.textContent = 'Findings';
+      auditContentEl.appendChild(findingsTitle);
+      for (const finding of analysis.findings) {
+        const row = document.createElement('div');
+        row.className = `audit-finding severity-${finding.severity === 'fail' ? 'fail' : finding.severity === 'warn' ? 'warn' : 'info'}`;
+        row.innerHTML = `
+          <div class="audit-finding-header">${escapeHtml(finding.title || 'Finding')}</div>
+          <div class="audit-finding-msg">${escapeHtml(finding.message || '')}</div>
+        `;
+        auditContentEl.appendChild(row);
+      }
+    }
+
+    if (Array.isArray(analysis.recommendations) && analysis.recommendations.length) {
+      const recCard = document.createElement('div');
+      recCard.className = 'card';
+      recCard.innerHTML = `
+        <div class="card-title"><span>Recommendations</span></div>
+        <div class="explain">${analysis.recommendations.map((item) => `• ${escapeHtml(item)}`).join('<br>')}</div>
+      `;
+      auditContentEl.appendChild(recCard);
+    }
+  }
+
   const section = document.createElement('div');
   section.className = 'audit-section-title';
   section.textContent = 'Node Results';
@@ -705,7 +819,7 @@ function renderAuditReport(report) {
     const excerpt = String(output.stderr || output.stdout || '').trim().slice(0, 180);
     row.innerHTML = `
       <div class="audit-finding-header">${escapeHtml(node.title || node.node_id)} · ${escapeHtml(node.status || '')}</div>
-      <div class="audit-finding-msg">风险: ${escapeHtml(node.risk_level || 'safe')} ${excerpt ? `· 输出: ${escapeHtml(excerpt)}` : ''}</div>
+      <div class="audit-finding-msg">类型: ${escapeHtml(node.type || 'command')} · 风险: ${escapeHtml(node.risk_level || 'safe')} · 依据: ${node.grounded ? 'grounded' : 'unverified'}${excerpt ? ` · 输出: ${escapeHtml(excerpt)}` : ''}</div>
     `;
     auditContentEl.appendChild(row);
   }
@@ -728,6 +842,7 @@ function renderAuditReport(report) {
       `- Overall: ${overall}`,
       `- Passed: ${report.passed || 0}/${report.total || 0}`,
       ``,
+      ...(analysis ? [`## Analysis`, ``, `- Severity: ${analysis.severity || ''}`, `- Summary: ${analysis.summary || ''}`, ``] : []),
       `## Nodes`,
       ...((report.nodes || []).map((node) => `- ${node.title || node.node_id}: ${node.status} (${node.risk_level})`)),
     ];
@@ -750,18 +865,22 @@ function updatePlanOpBar() {
   planPreAuditEl.textContent = `预审查: ${warnCount} 个 warn，${blockCount} 个 block，${currentPlan.nodes.filter((node) => node.grounded).length}/${currentPlan.nodes.length} 个节点有依据`;
 }
 
-function openNodePopover(node, target, forceApproval = false) {
-  if (!nodePopoverEl || !nodePopoverTitleEl || !nodePopoverBodyEl || !node) return;
-  nodePopoverTitleEl.textContent = node.title || node.id;
+function renderNodePopoverBody(node, forceApproval = false) {
+  if (!nodePopoverBodyEl || !node) return;
+  const output = getNodeOutputState(node.id);
+  const status = currentPlanNodeStatuses[node.id] || 'pending';
+  const outputText = String(output.stderr || output.stdout || '').trim();
   const citeHtml = Array.isArray(node.citations) && node.citations.length
     ? node.citations.slice(0, 2).map((citation) => `<div class="node-popover-citation">${escapeHtml(citation.title || citation.source || '')}: ${escapeHtml(citation.snippet || '')}</div>`).join('')
     : '<div class="node-popover-citation">暂无引用依据</div>';
   nodePopoverBodyEl.innerHTML = `
+    <div class="node-popover-row"><span class="node-popover-label">状态</span><span class="node-popover-value">${escapeHtml(status)}</span></div>
     <div class="node-popover-row"><span class="node-popover-label">类型</span><span class="node-popover-value">${escapeHtml(node.type || '')}</span></div>
     <div class="node-popover-row"><span class="node-popover-label">风险</span><span class="node-popover-value">${escapeHtml(node.risk_level || 'safe')}</span></div>
     <div class="node-popover-row"><span class="node-popover-label">说明</span><span class="node-popover-value">${escapeHtml(node.description || '')}</span></div>
     <div class="node-popover-cmd">${escapeHtml(node.command || '(no command)')}</div>
     ${node.rollback ? `<div class="node-popover-row"><span class="node-popover-label">回滚</span><span class="node-popover-value">${escapeHtml(node.rollback)}</span></div>` : ''}
+    ${outputText ? `<div class="node-popover-row"><span class="node-popover-label">输出</span><span class="node-popover-value">${output.exit_code === null || output.exit_code === undefined ? '' : `exit=${escapeHtml(String(output.exit_code))}`}</span></div><pre class="node-popover-output">${escapeHtml(outputText.slice(-1200))}</pre>` : '<div class="node-popover-citation">执行中输出会实时显示在这里。</div>'}
     ${citeHtml}
     <div class="actions" id="nodePopoverActions"></div>
   `;
@@ -780,11 +899,22 @@ function openNodePopover(node, target, forceApproval = false) {
         try {
           await apiPlanApproveNode(currentPlan.id, node.id);
           planRenderer.updateNodeStatus(node.id, 'running');
+          currentPlanNodeStatuses[node.id] = 'running';
           closeNodePopover();
         } catch (err) {
           writeError(String(err.message || err));
         }
       }, 'primary');
+      addBtn('跳过该节点', async () => {
+        try {
+          await apiPlanSkipNode(currentPlan.id, node.id);
+          currentPlanNodeStatuses[node.id] = 'skipped';
+          planRenderer.updateNodeStatus(node.id, 'skipped');
+          closeNodePopover();
+        } catch (err) {
+          writeError(String(err.message || err));
+        }
+      }, 'danger');
     }
     if (node.command) {
       addBtn('插入终端', () => {
@@ -793,19 +923,39 @@ function openNodePopover(node, target, forceApproval = false) {
       });
     }
   }
-  const rect = target && target.getBoundingClientRect ? target.getBoundingClientRect() : { right: window.innerWidth / 2, top: window.innerHeight / 2 };
+}
+
+function openNodePopover(node, target, forceApproval = false) {
+  if (!nodePopoverEl || !nodePopoverTitleEl || !nodePopoverBodyEl || !node) return;
+  currentPopoverNodeId = node.id || '';
+  nodePopoverTitleEl.textContent = node.title || node.id;
+  renderNodePopoverBody(node, forceApproval);
+  const currentLeft = parseInt(nodePopoverEl.style.left || '0', 10);
+  const currentTop = parseInt(nodePopoverEl.style.top || '0', 10);
+  const hasPinnedPosition = !Number.isNaN(currentLeft) && !Number.isNaN(currentTop) && !target;
+  const rect = target && target.getBoundingClientRect
+    ? target.getBoundingClientRect()
+    : hasPinnedPosition
+      ? { right: currentLeft + 300, top: currentTop }
+      : { right: window.innerWidth / 2, top: window.innerHeight / 2 };
   nodePopoverEl.style.left = `${Math.max(12, Math.min(window.innerWidth - 320, rect.right + 8))}px`;
   nodePopoverEl.style.top = `${Math.max(76, Math.min(window.innerHeight - 360, rect.top))}px`;
   nodePopoverEl.classList.remove('hidden');
 }
 
 function closeNodePopover() {
+  currentPopoverNodeId = '';
   if (nodePopoverEl) nodePopoverEl.classList.add('hidden');
 }
 
 function renderPlan(plan, intent) {
   currentPlan = plan;
   currentPlanIntent = intent || (plan && plan.intent) || '';
+  currentPlanNodeOutputs = {};
+  currentPlanNodeStatuses = {};
+  if (plan && Array.isArray(plan.nodes)) {
+    for (const node of plan.nodes) currentPlanNodeStatuses[node.id] = 'pending';
+  }
   updatePlanOpBar();
   planRenderer.render(plan, {
     onNodeClick: (node, target) => openNodePopover(node, target),
@@ -1329,6 +1479,10 @@ async function apiPlanExecute(planId) {
 
 async function apiPlanApproveNode(planId, nodeId) {
   return postJson(`/api/plan/${encodeURIComponent(planId)}/node/${encodeURIComponent(nodeId)}/approve`, {});
+}
+
+async function apiPlanSkipNode(planId, nodeId) {
+  return postJson(`/api/plan/${encodeURIComponent(planId)}/node/${encodeURIComponent(nodeId)}/skip`, {});
 }
 
 async function apiPlanCancel(planId) {
