@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(source:*)",
+      "Bash(pip3 install:*)",
+      "Bash(ls:*)",
+      "Bash(head:*)"
+    ]
+  }
+}

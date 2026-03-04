@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import os
 import re
+from datetime import datetime, timezone
+from uuid import uuid4
 
-from .models import Citation, CommandSuggestion, RiskLevel, SuggestRequest
+from .grounding import annotate_confidence
+from .models import Citation, CommandSuggestion, ExecutionPlan, PlanEdge, PlanNode, RiskLevel, SuggestRequest
 from .rag import retrieve
 
 
@@ -49,6 +52,144 @@ def _parse_git_branch_output(stdout: str) -> tuple[str | None, set[str], set[str
                     current = name
 
     return current, local, remote
+
+
+def _materialize_plan_command(
+    command: str,
+    *,
+    title: str,
+    intent: str,
+) -> str:
+    cmd = (command or "").strip()
+    if not cmd or "<PID>" not in cmd:
+        return cmd
+
+    title_lower = (title or "").lower()
+    intent_lower = (intent or "").lower()
+    mentions_port_8000 = "8000" in intent_lower or "8000" in cmd
+
+    if mentions_port_8000 and ("tasklist" in cmd.lower() or "taskkill" in cmd.lower()):
+        if "tasklist" in cmd.lower():
+            return (
+                'powershell -NoProfile -Command "$p = Get-NetTCPConnection -LocalPort 8000 '
+                '-State Listen -ErrorAction SilentlyContinue | Select-Object -First 1 '
+                '-ExpandProperty OwningProcess; if (-not $p) { Write-Host '
+                '\\"port 8000 not listening\\"; exit 1 }; '
+                'Get-Process -Id $p | Select-Object Id,ProcessName,Path | Format-Table -AutoSize"'
+            )
+        if "taskkill" in cmd.lower():
+            return (
+                'powershell -NoProfile -Command "$p = Get-NetTCPConnection -LocalPort 8000 '
+                '-State Listen -ErrorAction SilentlyContinue | Select-Object -First 1 '
+                '-ExpandProperty OwningProcess; if (-not $p) { Write-Host '
+                '\\"port 8000 not listening\\"; exit 1 }; '
+                'Stop-Process -Id $p -Force; Write-Host (\\"stopped pid \\" + $p)"'
+            )
+
+    if mentions_port_8000 and ("ps -p <pid>" in cmd.lower() or "kill <pid>" in cmd.lower() or "kill -9 <pid>" in cmd.lower()):
+        if "ps -p <pid>" in cmd.lower():
+            return "sh -lc 'pid=$(lsof -tiTCP:8000 -sTCP:LISTEN | head -n 1); [ -n \"$pid\" ] && ps -p \"$pid\" -o pid,ppid,user,cmd || { echo \"port 8000 not listening\"; exit 1; }'"
+        if "kill -9 <pid>" in cmd.lower():
+            return "sh -lc 'pid=$(lsof -tiTCP:8000 -sTCP:LISTEN | head -n 1); [ -n \"$pid\" ] && kill -9 \"$pid\" || { echo \"port 8000 not listening\"; exit 1; }'"
+        if "kill <pid>" in cmd.lower():
+            return "sh -lc 'pid=$(lsof -tiTCP:8000 -sTCP:LISTEN | head -n 1); [ -n \"$pid\" ] && kill \"$pid\" || { echo \"port 8000 not listening\"; exit 1; }'"
+
+    if mentions_port_8000 and "根据 pid 查看占用进程详细信息" in title_lower:
+        return (
+            'powershell -NoProfile -Command "$p = Get-NetTCPConnection -LocalPort 8000 '
+            '-State Listen -ErrorAction SilentlyContinue | Select-Object -First 1 '
+            '-ExpandProperty OwningProcess; if (-not $p) { Write-Host '
+            '\\"port 8000 not listening\\"; exit 1 }; '
+            'Get-Process -Id $p | Select-Object Id,ProcessName,Path | Format-Table -AutoSize"'
+        )
+
+    return cmd
+
+
+def build_execution_plan(*, intent: str, suggestions: list[CommandSuggestion]) -> ExecutionPlan:
+    """Build a minimal DAG execution plan from ordered command suggestions."""
+
+    nodes: list[PlanNode] = []
+    edges: list[PlanEdge] = []
+
+    # Root diagnose node to make the graph explicit even for single-command plans.
+    root_id = "n0"
+    nodes.append(
+        PlanNode(
+            id=root_id,
+            type="diagnose",
+            title="Analyze Intent",
+            command="",
+            risk_level=RiskLevel.safe,
+            grounded=False,
+            description=intent or "User intent analysis",
+            citations=[],
+        )
+    )
+
+    prev_id = root_id
+    counter = 1
+    for s in suggestions:
+        cmd = (s.command or "").strip()
+        if not cmd or cmd == "(auto)":
+            continue
+
+        node_type = "command"
+        title_lower = (s.title or "").lower()
+        cmd_lower = cmd.lower()
+        if "verify" in title_lower or "check" in title_lower or "status" in title_lower:
+            node_type = "verify"
+        elif "rollback" in title_lower or "revert" in title_lower:
+            node_type = "rollback"
+        elif s.requires_confirmation:
+            node_type = "human"
+
+        node_id = f"n{counter}"
+        counter += 1
+        nodes.append(
+            PlanNode(
+                id=node_id,
+                type=node_type,  # type: ignore[arg-type]
+                title=s.title or cmd,
+                command=_materialize_plan_command(
+                    cmd,
+                    title=s.title or cmd,
+                    intent=intent or "",
+                ),
+                risk_level=s.risk_level,
+                grounded=bool(s.citations),
+                description=s.explanation or "",
+                citations=list(s.citations or []),
+                rollback=s.rollback or "",
+            )
+        )
+        edges.append(PlanEdge(source_id=prev_id, target_id=node_id, condition="success", label="next"))
+        prev_id = node_id
+
+    end_id = f"n{counter}"
+    nodes.append(
+        PlanNode(
+            id=end_id,
+            type="end",
+            title="Done",
+            command="",
+            risk_level=RiskLevel.safe,
+            grounded=True,
+            description="Plan end",
+            citations=[],
+        )
+    )
+    edges.append(PlanEdge(source_id=prev_id, target_id=end_id, condition="success", label="done"))
+
+    return ExecutionPlan(
+        id=str(uuid4()),
+        intent=intent or "",
+        nodes=nodes,
+        edges=edges,
+        root_id=root_id,
+        generated_by="planner",
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
 
 
 def suggest(req: SuggestRequest) -> list[CommandSuggestion]:
@@ -366,45 +507,31 @@ def suggest(req: SuggestRequest) -> list[CommandSuggestion]:
         except Exception:
             llm_enabled = False
 
-    # If rules didn't produce any suggestions, fall back to LLM directly.
-    # (No longer gated by "natural-language" heuristics.)
+    # If rules didn't produce any suggestions, fall back to Multi-Agent Orchestrator.
+    # OrchestratorAgent: DiagAgent + RAGAgent (parallel) → ExecutorAgent → SafetyAgent
     if not suggestions and llm_enabled and last:
         try:
-            from .llm.modelscope_client import modelscope_chat_json_suggestions
+            from .agents import OrchestratorAgent
 
-            items = modelscope_chat_json_suggestions(
+            orchestrator = OrchestratorAgent()
+            agent_suggestions = orchestrator.process(
                 user_intent=last,
                 platform=req.platform,
                 last_stdout=stdout,
                 last_stderr=stderr,
+                last_exit_code=req.last_exit_code,
             )
-            for i, it in enumerate(items[:5]):
-                suggestions.append(
-                    CommandSuggestion(
-                        id=f"llm-{i}",
-                        title=it["title"],
-                        command=it["command"],
-                        explanation=it.get("explanation", ""),
-                        agent="llm",
-                        why=it.get("why", ""),
-                        risk=it.get("risk", ""),
-                        rollback=it.get("rollback", ""),
-                        verify=it.get("verify", ""),
-                        risk_level=RiskLevel.safe,
-                        tags=["llm"],
-                        citations=retrieve(it.get("command") or ""),
-                    )
-                )
+            suggestions.extend(agent_suggestions)
         except Exception as e:
             suggestions.append(
                 CommandSuggestion(
-                    id="llm-fallback",
-                    title="LLM 不可用（已回退规则）",
+                    id="agent-fallback",
+                    title="Agent 不可用（已回退规则）",
                     command="(auto)",
-                    explanation=f"ModelScope 调用失败：{str(e)[:200]}",
-                    agent="llm",
+                    explanation=f"Multi-Agent 调用失败：{str(e)[:200]}",
+                    agent="orchestrator",
                     risk_level=RiskLevel.safe,
-                    tags=["llm", "error"],
+                    tags=["agent", "error"],
                 )
             )
 
@@ -534,4 +661,9 @@ def suggest(req: SuggestRequest) -> list[CommandSuggestion]:
         s.citations = deduped[:3]
 
     max_n = int(os.getenv("TERMINAL_COPILOT_MAX_SUGGESTIONS", "6"))
-    return uniq[:max_n]
+    final = uniq[:max_n]
+
+    # 防幻觉：标注每条建议的置信度
+    annotate_confidence(final)
+
+    return final
