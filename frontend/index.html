@@ -1,4 +1,4 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
@@ -19,14 +19,49 @@
         <button class="seg-btn" data-exec="local" type="button">local</button>
       </div>
       <button id="reset" class="btn-export" title="清空本地缓存并创建新会话">新会话</button>
+      <button id="runbooks" class="btn-export">知识库</button>
       <button id="llm" class="btn-export">LLM设置</button>
       <div id="llmGuide" class="llm-guide hidden" role="note" aria-live="polite">
         <span id="llmGuideText">请在 LLM设置 中配置 Token 以启用 AI 功能</span>
         <button id="llmGuideOpen" type="button" class="llm-guide-btn">去配置</button>
       </div>
       <button id="export" class="btn-export">导出回放</button>
-      <div class="status" id="status">连接中…</div>
+      <div class="status" id="status">连接中...</div>
     </header>
+
+    <!-- 游客快速体验引导 -->
+    <div id="onboarding" class="onboarding-card hidden" aria-label="快速体验">
+      <div class="onboarding-header">
+        <span class="onboarding-icon">🤖</span>
+        <div>
+          <div class="onboarding-title">Terminal Copilot - Web 终端智能副驾</div>
+          <div class="onboarding-subtitle">30 秒体验 AI 运维助手，点击下方场景即可开始</div>
+        </div>
+        <button id="onboardingClose" class="onboarding-close" aria-label="关闭引导">×</button>
+      </div>
+      <div class="quick-demos">
+        <button class="demo-btn" data-demo="port" type="button">
+          <span class="demo-icon">📌</span>
+          <span class="demo-label">查端口占用</span>
+          <span class="demo-desc">端口 8000 被占用了怎么办</span>
+        </button>
+        <button class="demo-btn" data-demo="docker" type="button">
+          <span class="demo-icon">🐳</span>
+          <span class="demo-label">Docker 换源</span>
+          <span class="demo-desc">配置国内镜像加速 Docker</span>
+        </button>
+        <button class="demo-btn" data-demo="git" type="button">
+          <span class="demo-icon">🔧</span>
+          <span class="demo-label">修复 Git 拼写</span>
+          <span class="demo-desc">git chekcout main 命令拼写错了</span>
+        </button>
+        <button class="demo-btn" data-demo="custom" type="button">
+          <span class="demo-icon">💬</span>
+          <span class="demo-label">自由输入</span>
+          <span class="demo-desc">告诉 AI 你遇到的任何问题</span>
+        </button>
+      </div>
+    </div>
 
     <main class="layout">
       <section class="terminal-pane">
@@ -35,35 +70,87 @@
       </section>
 
       <aside class="side-pane">
-        <div class="side-title">任务流时间线</div>
-        <div id="steps" class="steps"></div>
-        <div class="side-subtitle">当前回合下一步建议</div>
-        <div id="suggestions" class="suggestions"></div>
+        <div class="side-tabs">
+          <button id="sideTabPlan" class="side-tab" type="button">🗺️ Execution Plan<span id="planTabDot" class="tab-dot hidden"></span></button>
+          <button id="sideTabTimeline" class="side-tab is-active" type="button">🧠 Agents</button>
+          <button id="sideTabAudit" class="side-tab" type="button">🧾 Audit & History</button>
+        </div>
+        <div id="timelinePanel" class="side-panel active">
+          <div class="side-title">Agent Collaboration</div>
+          <div class="side-subtitle">实时展示编排、诊断、检索、安全审查与执行器协作状态。</div>
+          <div id="agentPanel" class="agent-panel">
+            <div class="agent-panel-title">Multi-Agent 工作流</div>
+            <div id="agentSteps" class="agent-steps"></div>
+          </div>
+          <div class="side-title">任务流时间线</div>
+          <div id="steps" class="steps"></div>
+          <div class="side-subtitle">当前回合下一步建议</div>
+          <div id="suggestions" class="suggestions"></div>
+        </div>
+        <div id="planPanel" class="side-panel">
+          <!-- 操作栏 -->
+          <div id="planOpBar" class="plan-op-bar hidden">
+            <div class="plan-op-info">
+              <span id="planOpTitle" class="plan-op-title"></span>
+              <span id="planOpCount" class="plan-op-count"></span>
+            </div>
+            <div class="plan-op-btns">
+              <button id="planBtnFit" class="plan-btn" type="button" title="缩放适配">◎ 适配</button>
+              <button id="planBtnApprove" class="plan-btn plan-btn-green" type="button">✓ 批准全部</button>
+              <button id="planBtnEdit" class="plan-btn" type="button">✎ 编辑模式</button>
+              <button id="planBtnExecute" class="plan-btn plan-btn-green" type="button">▶ 开始执行</button>
+              <button id="planBtnPause" class="plan-btn" type="button" style="display:none">⏸ 暂停</button>
+              <button id="planBtnStop" class="plan-btn" type="button" style="display:none">⏹ 中断</button>
+            </div>
+            <div id="planPreAudit" class="plan-preaudit"></div>
+          </div>
+          <div id="planGraph" class="plan-graph"></div>
+        </div>
+        <div id="auditPanel" class="side-panel">
+          <div class="side-title">📋 自动审计报告</div>
+          <div id="auditContent" class="audit-content">
+            <div class="audit-empty">执行计划完成后，自动审计报告将在此展示。</div>
+          </div>
+        </div>
       </aside>
-    </main>
 
+      <!-- 节点详情浮层 -->
+      <div id="nodePopover" class="node-popover hidden" role="dialog" aria-modal="false">
+        <div class="node-popover-header">
+          <span id="nodePopoverTitle" class="node-popover-title"></span>
+          <button id="nodePopoverClose" class="node-popover-close" type="button" aria-label="关闭">×</button>
+        </div>
+        <div id="nodePopoverBody" class="node-popover-body"></div>
+      </div>
+    </main>
     <!-- LLM Token Modal -->
     <div id="llmModal" class="modal hidden" aria-hidden="true">
       <div class="modal-backdrop"></div>
       <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="llmTitle">
-        <div class="modal-title" id="llmTitle">配置 ModelScope</div>
+        <div class="modal-title" id="llmTitle">配置 LLM Provider</div>
         <div class="modal-body">
-          <div class="explain">Token 将写入本地 <span class="mono">.secrets/modelscope_access_token.txt</span>（已加入 gitignore）。同时会保存在当前浏览器标签页会话（刷新不丢，关闭标签页会清除）。</div>
-          <input id="llmTokenInput" class="modal-input" type="password" placeholder="粘贴 ModelScope Access Token" autocomplete="off" />
-          <div class="explain">模型ID（ModelScope Model-Id），例如：<span class="mono">Qwen/Qwen2.5-Coder-32B-Instruct</span></div>
-          <div id="llmModelDropdown" class="dropdown">
-            <button id="llmModelDropdownBtn" class="modal-input dropdown-btn" type="button" aria-haspopup="listbox" aria-expanded="false">
-              常用模型（点击选择后自动填入）…
+          <div class="explain">配置会写入 <span class="mono">.secrets/llm_*.txt</span>（已加入 gitignore），并在当前标签页会话缓存 token。</div>
+          <div class="explain">Provider</div>
+          <div id="llmProviderDropdown" class="dropdown">
+            <button id="llmProviderDropdownBtn" class="modal-input dropdown-btn" type="button" aria-haspopup="listbox" aria-expanded="false">
+              选择 Provider...
             </button>
-            <div id="llmModelDropdownMenu" class="dropdown-menu hidden" role="listbox" aria-label="常用模型">
-              <div class="dropdown-item" role="option" tabindex="0" data-value="Qwen/Qwen2.5-Coder-32B-Instruct">Qwen/Qwen2.5-Coder-32B-Instruct（代码最强）</div>
-              <div class="dropdown-item" role="option" tabindex="0" data-value="deepseek-ai/DeepSeek-R1">deepseek-ai/DeepSeek-R1（推理/规划强）</div>
-              <div class="dropdown-item" role="option" tabindex="0" data-value="MiniMax/MiniMax-M2.1">MiniMax/MiniMax-M2.1（长周期规划/Agent）</div>
-              <div class="dropdown-item" role="option" tabindex="0" data-value="Qwen/Qwen3-32B">Qwen/Qwen3-32B（Qwen3 通用）</div>
-              <div class="dropdown-item" role="option" tabindex="0" data-value="ZhipuAI/GLM-4.7">ZhipuAI/GLM-4.7（通用/Agent）</div>
+            <div id="llmProviderDropdownMenu" class="dropdown-menu hidden" role="listbox" aria-label="Provider">
             </div>
           </div>
-          <input id="llmModelInput" class="modal-input" type="text" placeholder="Qwen/Qwen2.5-Coder-32B-Instruct" autocomplete="off" />
+          <input id="llmProviderSelect" type="hidden" value="modelscope" />
+          <div class="explain">Access Token / API Key</div>
+          <input id="llmTokenInput" class="modal-input" type="password" placeholder="粘贴 API Token" autocomplete="off" />
+          <div class="explain">Base URL（可选覆盖）</div>
+          <input id="llmBaseUrlInput" class="modal-input" type="text" placeholder="https://api.moonshot.cn/v1/" autocomplete="off" />
+          <div class="explain">模型 ID，例如 <span class="mono">kimi-k2.5</span> 或 <span class="mono">moonshotai/Kimi-K2.5</span></div>
+          <div id="llmModelDropdown" class="dropdown">
+            <button id="llmModelDropdownBtn" class="modal-input dropdown-btn" type="button" aria-haspopup="listbox" aria-expanded="false">
+              常用模型（点击选择后自动填入）...
+            </button>
+            <div id="llmModelDropdownMenu" class="dropdown-menu hidden" role="listbox" aria-label="常用模型"></div>
+          </div>
+          <input id="llmModelInput" class="modal-input" type="text" placeholder="kimi-k2.5" autocomplete="off" />
           <div id="llmModalHint" class="explain"></div>
         </div>
         <div class="modal-actions">
@@ -74,8 +161,32 @@
       </div>
     </div>
 
+    <div id="runbookModal" class="modal hidden" aria-hidden="true">
+      <div class="modal-backdrop"></div>
+      <div class="modal-card modal-wide" role="dialog" aria-modal="true" aria-labelledby="runbookTitle">
+        <div class="modal-title" id="runbookTitle">知识库管理</div>
+        <div class="modal-body">
+          <div class="explain">上传 Markdown Runbook 后会立即进入本地知识库，供建议生成和执行计划引用。</div>
+          <div class="runbook-toolbar">
+            <input id="runbookFileName" class="modal-input" type="text" placeholder="runbook-demo.md" />
+            <input id="runbookFileInput" type="file" accept=".md,text/markdown" />
+            <button id="runbookRefresh" type="button">刷新列表</button>
+          </div>
+          <textarea id="runbookContentInput" class="modal-input runbook-editor" placeholder="# 标题&#10;&#10;在这里粘贴或加载 Markdown Runbook 内容"></textarea>
+          <div id="runbookList" class="runbook-list"></div>
+        </div>
+        <div class="modal-actions">
+          <button id="runbookClose" type="button">关闭</button>
+          <button id="runbookSave" class="primary" type="button">上传到知识库</button>
+        </div>
+      </div>
+    </div>
+
     <script src="https://unpkg.com/xterm/lib/xterm.js"></script>
     <script src="https://unpkg.com/xterm-addon-fit/lib/xterm-addon-fit.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dagre/0.8.5/dagre.min.js"></script>
     <script src="/static/app.js"></script>
   </body>
 </html>
+
