@@ -59,6 +59,7 @@ class ExecutorAgent(BaseAgent):
         last_stdout: str = "",
         last_stderr: str = "",
         event_queue=None,
+        conversation_messages: list[dict] | None = None,
     ) -> list[dict]:
         """便捷接口：生成建议列表。优先 Function Calling，降级到直接 JSON。"""
         user_content = json.dumps(
@@ -75,6 +76,7 @@ class ExecutorAgent(BaseAgent):
                 ][:3],
                 "last_stdout": (last_stdout or "")[:400],
                 "last_stderr": (last_stderr or "")[:400],
+                "conversation_messages": (conversation_messages or [])[-12:],
             },
             ensure_ascii=False,
         )

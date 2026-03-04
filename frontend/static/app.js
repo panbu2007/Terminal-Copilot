@@ -6,6 +6,7 @@ const suggestionsEl = document.getElementById('suggestions');
 const hintEl = document.getElementById('hint');
 const exportBtn = document.getElementById('export');
 const resetBtn = document.getElementById('reset');
+const askAiBtn = document.getElementById('askAi');
 const runbooksBtn = document.getElementById('runbooks');
 const llmBtn = document.getElementById('llm');
 const llmModal = document.getElementById('llmModal');
@@ -26,6 +27,7 @@ const llmModalHint = document.getElementById('llmModalHint');
 const llmSaveBtn = document.getElementById('llmSave');
 const llmCloseBtn = document.getElementById('llmClose');
 const llmTestBtn = document.getElementById('llmTest');
+const terminalModeSwitchEl = document.getElementById('terminalModeSwitch');
 const executorSwitchEl = document.getElementById('executorSwitch');
 const sideTabTimelineEl = document.getElementById('sideTabTimeline');
 const sideTabPlanEl = document.getElementById('sideTabPlan');
@@ -65,6 +67,13 @@ const runbookContentInputEl = document.getElementById('runbookContentInput');
 const runbookListEl = document.getElementById('runbookList');
 
 let currentExecutorMode = '';
+let ptySupported = false;
+let terminalMode = 'plan';
+let ptyWebSocket = null;
+let termDataDisposable = null;
+let termResizeDisposable = null;
+const ptyControlRequests = new Map();
+let ptyControlSeq = 0;
 
 // cwd prompt
 let currentCwd = '';
@@ -90,6 +99,7 @@ function promptPrefix() {
 }
 
 function softRedrawPromptLine(nextLine, nextCursorPos = null) {
+  if (terminalMode === 'pty') return;
   try {
     const next = String(nextLine || '');
     const nextPrompt = promptPrefix();
@@ -120,6 +130,7 @@ function softRedrawPromptLine(nextLine, nextCursorPos = null) {
 }
 
 function refreshPrompt() {
+  if (terminalMode === 'pty') return;
   try {
     const line = String(currentLine || '');
     const pos = Math.max(0, Math.min(cursorPos, line.length));
@@ -186,7 +197,7 @@ function renderPendingConfirmation() {
     const c = pendingConfirmation ? String(pendingConfirmation.command || '') : '';
     clearPendingConfirmation();
     if (!c) return;
-    await runCommand(c, true);
+    await dispatchTerminalCommand(c, true);
   };
 
   const btnCancel = document.createElement('button');
@@ -994,7 +1005,7 @@ function isLikelyNaturalLanguage(text) {
   return false;
 }
 
-async function streamSuggestionsForIntent(intent) {
+async function streamSuggestionsForIntent(intent, extraPayload = {}) {
   closeSuggestStream();
   resetAgentPanel('准备任务...');
   switchSidePanel('timeline');
@@ -1011,6 +1022,7 @@ async function streamSuggestionsForIntent(intent) {
       last_stdout: '',
       last_stderr: '',
       platform: getPlatform(),
+      ...extraPayload,
     }),
     signal: controller.signal,
   });
@@ -1120,7 +1132,7 @@ async function startIntentIteration(intent, { autoExecute = false } = {}) {
           writeInfoAbovePrompt('该建议需要确认：请在右侧点击「确认执行」。');
           return;
         }
-        await runCommand(s.command, false);
+        await dispatchTerminalCommand(s.command, false);
       }
     );
     const plan = await generateExecutionPlan(normalized, sug.suggestions || []);
@@ -1132,9 +1144,63 @@ async function startIntentIteration(intent, { autoExecute = false } = {}) {
   }
 }
 
+async function requestPtySuggestion() {
+  if (terminalMode !== 'pty') {
+    writeInfoAbovePrompt('当前不在 PTY 模式。');
+    return;
+  }
+
+  const intent = window.prompt('请输入你想让 AI 协助的问题');
+  const normalized = String(intent || '').trim();
+  if (!normalized) return;
+
+  try {
+    statusEl.textContent = '提取终端上下文中...';
+    await requestPTYControl('ai_suggest', { intent: normalized });
+    const ctx = await requestPTYControl('ai_context');
+    const conversationMessages = Array.isArray(ctx.conversation_messages) ? ctx.conversation_messages : [];
+    if (ctx.cwd) currentCwd = String(ctx.cwd);
+
+    const sug = await streamSuggestionsForIntent(normalized, {
+      last_stdout: String(ctx.recent_output || ''),
+      last_stderr: '',
+      conversation_messages: conversationMessages,
+    });
+
+    if (Array.isArray(sug.suggestions)) {
+      renderSuggestions(
+        sug.suggestions,
+        (s) => {
+          if (s.command === '(auto)') return;
+          insertTextAtCursor(s.command);
+        },
+        async (s) => {
+          if (s.command === '(auto)') return;
+          if (s.risk_level === 'block') {
+            writeError('该命令被安全策略拦截（block）。');
+            return;
+          }
+          if (s.requires_confirmation) {
+            setPendingConfirmation(s.command, '风险等级为 warn（可能影响系统/数据），建议确认后再执行。');
+            return;
+          }
+          await dispatchTerminalCommand(s.command, false);
+        }
+      );
+    }
+    setStatusReady();
+  } catch (err) {
+    statusEl.textContent = '错误';
+    writeError(String(err.message || err));
+  }
+}
+
 function setStatusReady() {
   const mode = currentExecutorMode ? String(currentExecutorMode) : 'unknown';
-  statusEl.textContent = isSuggesting ? `就绪（executor=${mode}，生成建议中...）` : `就绪（executor=${mode}）`;
+  const termLabel = terminalMode === 'pty' ? 'pty' : 'plan';
+  statusEl.textContent = isSuggesting
+    ? `就绪（terminal=${termLabel}，executor=${mode}，生成建议中...）`
+    : `就绪（terminal=${termLabel}，executor=${mode}）`;
 }
 
 function setLlmGuideVisible(visible, text) {
@@ -1957,6 +2023,12 @@ function redrawPromptLine(nextLine) {
 function insertTextAtCursor(text) {
   const t = String(text || '');
   if (!t) return;
+  if (terminalMode === 'pty') {
+    if (ptyWebSocket && ptyWebSocket.readyState === WebSocket.OPEN) {
+      ptyWebSocket.send(new TextEncoder().encode(t));
+    }
+    return;
+  }
 
   // Fast path: appending at end (most common typing case) - avoid full redraw.
   if (cursorPos === currentLine.length) {
@@ -1995,7 +2067,192 @@ function historyDown() {
   redrawPromptLine(v);
 }
 
+async function ensureSessionId() {
+  let sid = getSessionId();
+  if (sid) {
+    try {
+      const res = await fetch(`/api/sessions/${encodeURIComponent(sid)}`);
+      if (res.ok) return sid;
+    } catch {
+      // ignore and recreate
+    }
+  }
+  const session = await apiNewSession();
+  return session && session.session_id ? String(session.session_id) : '';
+}
+
+function disconnectPTY({ clearRef = true } = {}) {
+  if (!ptyWebSocket) return;
+  try {
+    ptyWebSocket.close();
+  } catch {
+    // ignore
+  }
+  if (clearRef) ptyWebSocket = null;
+}
+
+async function connectPTY() {
+  const sessionId = await ensureSessionId();
+  if (!sessionId) throw new Error('session_unavailable');
+
+  disconnectPTY();
+  clearTerminalUi();
+  writeInfo('连接真实终端...');
+
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(`${protocol}//${location.host}/ws/terminal/${encodeURIComponent(sessionId)}`);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => {
+    statusEl.textContent = '真实终端已连接';
+    try {
+      ws.send(JSON.stringify({ type: 'resize', rows: term.rows, cols: term.cols }));
+    } catch {
+      // ignore
+    }
+  };
+
+  ws.onmessage = (event) => {
+    if (event.data instanceof ArrayBuffer) {
+      term.write(new Uint8Array(event.data));
+      return;
+    }
+
+    try {
+      const payload = JSON.parse(String(event.data || '{}'));
+      if (payload.request_id && ptyControlRequests.has(payload.request_id)) {
+        const pending = ptyControlRequests.get(payload.request_id);
+        clearTimeout(pending.timer);
+        ptyControlRequests.delete(payload.request_id);
+        pending.resolve(payload.data || payload);
+        return;
+      }
+      if (payload.type === 'terminal_status' && payload.status === 'unsupported') {
+        ptySupported = false;
+        writeError('当前运行环境不支持 PTY，已切回计划模式。');
+        void setTerminalMode('plan');
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  ws.onclose = () => {
+    for (const [requestId, pending] of ptyControlRequests.entries()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error('pty_disconnected'));
+      ptyControlRequests.delete(requestId);
+    }
+    if (ptyWebSocket === ws) ptyWebSocket = null;
+    if (terminalMode === 'pty') statusEl.textContent = '真实终端连接已断开';
+  };
+
+  ws.onerror = () => {
+    if (terminalMode === 'pty') statusEl.textContent = '真实终端连接错误';
+  };
+
+  ptyWebSocket = ws;
+}
+
+function bindPlanModeInput() {
+  if (termDataDisposable) termDataDisposable.dispose();
+  if (termResizeDisposable) termResizeDisposable.dispose();
+  termResizeDisposable = null;
+  termDataDisposable = term.onData((data) => {
+    void handlePlanModeInput(data);
+  });
+}
+
+function bindPTYModeInput() {
+  if (termDataDisposable) termDataDisposable.dispose();
+  if (termResizeDisposable) termResizeDisposable.dispose();
+  termDataDisposable = term.onData((data) => {
+    if (ptyWebSocket && ptyWebSocket.readyState === WebSocket.OPEN) {
+      ptyWebSocket.send(new TextEncoder().encode(data));
+    }
+  });
+  termResizeDisposable = term.onResize(({ rows, cols }) => {
+    if (ptyWebSocket && ptyWebSocket.readyState === WebSocket.OPEN) {
+      ptyWebSocket.send(JSON.stringify({ type: 'resize', rows, cols }));
+    }
+  });
+}
+
+function applyTerminalModeUi() {
+  if (!terminalModeSwitchEl) return;
+  for (const btn of Array.from(terminalModeSwitchEl.querySelectorAll('button[data-term-mode]'))) {
+    const mode = String(btn.getAttribute('data-term-mode') || '').trim();
+    btn.classList.toggle('is-active', mode === terminalMode);
+    if (mode === 'pty') btn.disabled = !ptySupported;
+  }
+  if (askAiBtn) askAiBtn.disabled = terminalMode !== 'pty' || !ptySupported;
+}
+
+async function setTerminalMode(mode) {
+  const next = mode === 'pty' && ptySupported ? 'pty' : 'plan';
+  const prev = terminalMode;
+  terminalMode = next;
+  applyTerminalModeUi();
+
+  if (next === 'pty') {
+    bindPTYModeInput();
+    await connectPTY();
+    return;
+  }
+
+  if (prev === 'pty' && ptyWebSocket && ptyWebSocket.readyState === WebSocket.OPEN) {
+    try {
+      const ctx = await requestPTYControl('ai_context');
+      if (ctx && typeof ctx.cwd === 'string' && ctx.cwd) currentCwd = ctx.cwd;
+    } catch {
+      // ignore best-effort cwd sync
+    }
+  }
+  disconnectPTY();
+  bindPlanModeInput();
+  clearTerminalUi();
+  prompt();
+  setStatusReady();
+}
+
+function requestPTYControl(type, payload = {}) {
+  return new Promise((resolve, reject) => {
+    if (!ptyWebSocket || ptyWebSocket.readyState !== WebSocket.OPEN) {
+      reject(new Error('pty_not_connected'));
+      return;
+    }
+    const requestId = `pty-${Date.now()}-${++ptyControlSeq}`;
+    const timer = setTimeout(() => {
+      ptyControlRequests.delete(requestId);
+      reject(new Error(`${type}_timeout`));
+    }, 8000);
+    ptyControlRequests.set(requestId, {
+      resolve,
+      reject,
+      timer,
+      type,
+    });
+    ptyWebSocket.send(JSON.stringify({ type, request_id: requestId, ...payload }));
+  });
+}
+
+async function dispatchTerminalCommand(cmd, confirmed = false) {
+  if (terminalMode === 'pty') {
+    if (!ptyWebSocket || ptyWebSocket.readyState !== WebSocket.OPEN) {
+      await connectPTY();
+    }
+    if (!ptyWebSocket || ptyWebSocket.readyState !== WebSocket.OPEN) {
+      throw new Error('pty_not_connected');
+    }
+    if (confirmed) writeInfo('PTY 模式下确认后直接写入真实终端。');
+    ptyWebSocket.send(new TextEncoder().encode(`${cmd}\r`));
+    return null;
+  }
+  return runCommand(cmd, confirmed);
+}
+
 function prompt() {
+  if (terminalMode === 'pty') return;
   lastRenderedPromptPrefix = promptPrefix();
   term.write(`\r\n${lastRenderedPromptPrefix}`);
   currentLine = '';
@@ -2034,6 +2291,10 @@ function writeInfo(msg) {
 }
 
 function writeInfoAbovePrompt(msg) {
+  if (terminalMode === 'pty') {
+    writeInfo(msg);
+    return;
+  }
   // Print an info line above the current prompt, without leaving the cursor after the info.
   const typed = currentLine;
   const pos = cursorPos;
@@ -2047,6 +2308,9 @@ function writeInfoAbovePrompt(msg) {
 }
 
 async function runCommand(cmd, confirmed = false) {
+  if (terminalMode === 'pty') {
+    return dispatchTerminalCommand(cmd, confirmed);
+  }
   let prompted = false;
   try {
     statusEl.textContent = '执行中...';
@@ -2190,7 +2454,7 @@ async function runCommand(cmd, confirmed = false) {
               writeInfoAbovePrompt('该建议需要确认：请在右侧点击「确认执行」。');
               return;
             }
-            await runCommand(s.command, false);
+            await dispatchTerminalCommand(s.command, false);
           }
         );
       } catch (e) {
@@ -2217,8 +2481,7 @@ async function runCommand(cmd, confirmed = false) {
   }
 }
 
-term.write('Terminal Copilot (MVP)');
-prompt();
+clearTerminalUi();
 
 // On browser refresh, do NOT restore the previous task flow/timeline.
 // Users expect a clean slate after reload.
@@ -2742,7 +3005,7 @@ document.addEventListener('click', (ev) => {
   setProviderDropdownOpen(false);
 });
 
-term.onData(async (data) => {
+async function handlePlanModeInput(data) {
   // Ctrl+C
   if (data === '\x03') {
     if (isExecuting) {
@@ -2879,7 +3142,7 @@ term.onData(async (data) => {
   if (data >= ' ' && data !== '\x7f') {
     insertTextAtCursor(data);
   }
-});
+}
 
 if (executorSwitchEl) {
   executorSwitchEl.addEventListener('click', async (ev) => {
@@ -2916,6 +3179,8 @@ if (executorSwitchEl) {
 (async () => {
   try {
     const h = await apiHealth();
+    ptySupported = String(h.pty_supported || '0') === '1';
+    applyTerminalModeUi();
 
     // Hosted Spaces: avoid persisting token/session across refresh by default.
     // Backend returns persist_client_state as "1" or "0".
@@ -2929,11 +3194,11 @@ if (executorSwitchEl) {
     const m = st ? (st.mode || st.current_mode) : '';
     if (m) {
       currentExecutorMode = String(m);
-      setStatusReady();
+      await setTerminalMode(ptySupported ? 'pty' : 'plan');
       return;
     }
     if (h && h.executor) currentExecutorMode = String(h.executor);
-    setStatusReady();
+    await setTerminalMode(ptySupported ? 'pty' : 'plan');
   } catch {
     statusEl.textContent = '后端未连接';
   }
@@ -2947,8 +3212,7 @@ if (resetBtn) {
       statusEl.textContent = '重置中...';
       // Keep the LLM token in sessionStorage; only reset session/timeline/UI.
       await resetClientState({ clearToken: false, newSession: true, refreshPrompt: false });
-      clearTerminalUi();
-      setStatusReady();
+      await setTerminalMode(terminalMode);
     } catch (e) {
       statusEl.textContent = '错误';
       writeError(String(e.message || e));
@@ -2957,6 +3221,30 @@ if (resetBtn) {
     }
   });
 }
+
+if (terminalModeSwitchEl) {
+  terminalModeSwitchEl.addEventListener('click', async (ev) => {
+    const btn = ev.target && ev.target.closest ? ev.target.closest('button[data-term-mode]') : null;
+    if (!btn || btn.disabled) return;
+    const nextMode = String(btn.getAttribute('data-term-mode') || '').trim();
+    if (!nextMode || nextMode === terminalMode) return;
+    await setTerminalMode(nextMode);
+  });
+}
+
+if (askAiBtn) {
+  askAiBtn.addEventListener('click', async () => {
+    await requestPtySuggestion();
+  });
+}
+
+document.addEventListener('keydown', (ev) => {
+  if (terminalMode !== 'pty') return;
+  if (ev.ctrlKey && ev.code === 'Space') {
+    ev.preventDefault();
+    void requestPtySuggestion();
+  }
+});
 
 if (exportBtn) {
   exportBtn.addEventListener('click', async () => {

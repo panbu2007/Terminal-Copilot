@@ -520,6 +520,7 @@ def suggest(req: SuggestRequest) -> list[CommandSuggestion]:
                 last_stdout=stdout,
                 last_stderr=stderr,
                 last_exit_code=req.last_exit_code,
+                conversation_messages=req.conversation_messages,
             )
             suggestions.extend(agent_suggestions)
         except Exception as e:

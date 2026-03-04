@@ -38,6 +38,7 @@ class OrchestratorAgent:
         last_stderr: str = "",
         last_exit_code: int | None = None,
         event_queue: Queue | None = None,
+        conversation_messages: list[dict] | None = None,
     ) -> list[CommandSuggestion]:
         """主入口：协调各 Agent 生成建议列表。
 
@@ -87,6 +88,7 @@ class OrchestratorAgent:
             last_stdout=last_stdout,
             last_stderr=last_stderr,
             event_queue=event_queue,
+            conversation_messages=conversation_messages,
         )
         emit("executor", "done", f"生成 {len(raw_suggestions)} 条建议")
 

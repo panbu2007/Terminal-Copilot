@@ -8,12 +8,14 @@ import platform as _platform
 from datetime import datetime, timezone
 from pathlib import Path
 import shlex
+import threading
 
 import asyncio
 import json
 from queue import Empty, Queue
+from uuid import UUID
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket
 from pydantic import BaseModel
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -61,10 +63,12 @@ from .plan_executor import (
 )
 from .planner import build_execution_plan, suggest
 from .policy import evaluate
+from .pty_manager import PTY_IDLE_TIMEOUT_SECONDS, cleanup_idle_sessions, pty_supported
 from .rag import refresh_docs_cache
 from .rag_v2 import refresh_vector_cache
 from .store import STORE
 from .verifier import maybe_verify
+from .ws_terminal import handle_terminal_ws
 
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -277,6 +281,19 @@ def _startup_llm_guide() -> None:
     logger.warning("local secret path: .secrets/llm_access_token.txt (gitignored)")
 
 
+@app.on_event("startup")
+def _startup_pty_cleanup() -> None:
+    def _loop() -> None:
+        while True:
+            time.sleep(300)
+            try:
+                cleanup_idle_sessions(PTY_IDLE_TIMEOUT_SECONDS)
+            except Exception:
+                logger.exception("pty cleanup loop failed")
+
+    threading.Thread(target=_loop, daemon=True, name="pty-cleanup").start()
+
+
 def _is_running_in_container() -> bool:
     """Best-effort container detection (for hosted Spaces behavior)."""
     try:
@@ -326,7 +343,24 @@ def health() -> dict[str, str]:
         "status": "ok",
         "executor": ex.name,
         "persist_client_state": "1" if _persist_client_state() else "0",
+        "pty_supported": "1" if pty_supported() else "0",
     }
+
+
+@app.websocket("/ws/terminal/{session_id}")
+async def ws_terminal(session_id: str, ws: WebSocket) -> None:
+    if session_id == "new":
+        session = STORE.get_or_create(None)
+    else:
+        try:
+            session = STORE.get_or_create(UUID(session_id))
+        except ValueError:
+            await ws.close(code=1008, reason="invalid_session_id")
+            return
+
+    local_root = Path(os.getenv("TERMINAL_COPILOT_LOCAL_ROOT", str(REPO_ROOT))).resolve()
+    cwd = session.cwd or str(local_root)
+    await handle_terminal_ws(ws, str(session.id), cwd)
 
 
 @app.get("/api/executor/status", response_model=ExecutorStatusResponse)
@@ -605,6 +639,7 @@ async def api_suggest_stream(req: SuggestRequest) -> StreamingResponse:
                     last_stderr=req.last_stderr,
                     last_exit_code=req.last_exit_code,
                     event_queue=q,
+                    conversation_messages=req.conversation_messages,
                 )
                 final = agent_suggestions if agent_suggestions else rule_suggestions
             else:

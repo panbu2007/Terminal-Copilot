@@ -45,6 +45,7 @@ class SuggestRequest(BaseModel):
     last_stdout: str = ""
     last_stderr: str = ""
     platform: Literal["windows", "linux", "mac"] | None = None
+    conversation_messages: list[dict[str, str]] | None = None
     extra: dict[str, Any] = Field(default_factory=dict)
 
 
