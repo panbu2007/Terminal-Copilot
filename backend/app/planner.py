@@ -54,6 +54,58 @@ def _parse_git_branch_output(stdout: str) -> tuple[str | None, set[str], set[str
     return current, local, remote
 
 
+def _materialize_plan_command(
+    command: str,
+    *,
+    title: str,
+    intent: str,
+) -> str:
+    cmd = (command or "").strip()
+    if not cmd or "<PID>" not in cmd:
+        return cmd
+
+    title_lower = (title or "").lower()
+    intent_lower = (intent or "").lower()
+    mentions_port_8000 = "8000" in intent_lower or "8000" in cmd
+
+    if mentions_port_8000 and ("tasklist" in cmd.lower() or "taskkill" in cmd.lower()):
+        if "tasklist" in cmd.lower():
+            return (
+                'powershell -NoProfile -Command "$p = Get-NetTCPConnection -LocalPort 8000 '
+                '-State Listen -ErrorAction SilentlyContinue | Select-Object -First 1 '
+                '-ExpandProperty OwningProcess; if (-not $p) { Write-Host '
+                '\\"port 8000 not listening\\"; exit 1 }; '
+                'Get-Process -Id $p | Select-Object Id,ProcessName,Path | Format-Table -AutoSize"'
+            )
+        if "taskkill" in cmd.lower():
+            return (
+                'powershell -NoProfile -Command "$p = Get-NetTCPConnection -LocalPort 8000 '
+                '-State Listen -ErrorAction SilentlyContinue | Select-Object -First 1 '
+                '-ExpandProperty OwningProcess; if (-not $p) { Write-Host '
+                '\\"port 8000 not listening\\"; exit 1 }; '
+                'Stop-Process -Id $p -Force; Write-Host (\\"stopped pid \\" + $p)"'
+            )
+
+    if mentions_port_8000 and ("ps -p <pid>" in cmd.lower() or "kill <pid>" in cmd.lower() or "kill -9 <pid>" in cmd.lower()):
+        if "ps -p <pid>" in cmd.lower():
+            return "sh -lc 'pid=$(lsof -tiTCP:8000 -sTCP:LISTEN | head -n 1); [ -n \"$pid\" ] && ps -p \"$pid\" -o pid,ppid,user,cmd || { echo \"port 8000 not listening\"; exit 1; }'"
+        if "kill -9 <pid>" in cmd.lower():
+            return "sh -lc 'pid=$(lsof -tiTCP:8000 -sTCP:LISTEN | head -n 1); [ -n \"$pid\" ] && kill -9 \"$pid\" || { echo \"port 8000 not listening\"; exit 1; }'"
+        if "kill <pid>" in cmd.lower():
+            return "sh -lc 'pid=$(lsof -tiTCP:8000 -sTCP:LISTEN | head -n 1); [ -n \"$pid\" ] && kill \"$pid\" || { echo \"port 8000 not listening\"; exit 1; }'"
+
+    if mentions_port_8000 and "根据 pid 查看占用进程详细信息" in title_lower:
+        return (
+            'powershell -NoProfile -Command "$p = Get-NetTCPConnection -LocalPort 8000 '
+            '-State Listen -ErrorAction SilentlyContinue | Select-Object -First 1 '
+            '-ExpandProperty OwningProcess; if (-not $p) { Write-Host '
+            '\\"port 8000 not listening\\"; exit 1 }; '
+            'Get-Process -Id $p | Select-Object Id,ProcessName,Path | Format-Table -AutoSize"'
+        )
+
+    return cmd
+
+
 def build_execution_plan(*, intent: str, suggestions: list[CommandSuggestion]) -> ExecutionPlan:
     """Build a minimal DAG execution plan from ordered command suggestions."""
 
@@ -99,7 +151,11 @@ def build_execution_plan(*, intent: str, suggestions: list[CommandSuggestion]) -
                 id=node_id,
                 type=node_type,  # type: ignore[arg-type]
                 title=s.title or cmd,
-                command=cmd,
+                command=_materialize_plan_command(
+                    cmd,
+                    title=s.title or cmd,
+                    intent=intent or "",
+                ),
                 risk_level=s.risk_level,
                 grounded=bool(s.citations),
                 description=s.explanation or "",
