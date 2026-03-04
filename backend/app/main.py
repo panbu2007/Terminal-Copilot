@@ -17,7 +17,7 @@ from uuid import UUID
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket
 from pydantic import BaseModel
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .executor import get_executor, get_executor_mode, set_executor_mode
@@ -1297,3 +1297,8 @@ def index() -> FileResponse:
             "Pragma": "no-cache",
         },
     )
+
+
+@app.get("/favicon.ico")
+def favicon() -> Response:
+    return Response(status_code=204)

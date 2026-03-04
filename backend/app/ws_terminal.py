@@ -62,6 +62,8 @@ async def handle_terminal_ws(ws: WebSocket, session_id: str, cwd: str) -> None:
     try:
         while True:
             message = await ws.receive()
+            if message.get("type") == "websocket.disconnect":
+                break
 
             if "bytes" in message and message["bytes"] is not None:
                 try:
@@ -129,6 +131,11 @@ async def handle_terminal_ws(ws: WebSocket, session_id: str, cwd: str) -> None:
                 )
     except WebSocketDisconnect:
         logger.info("terminal websocket disconnected sid=%s", session_id)
+    except RuntimeError as exc:
+        if "disconnect message" in str(exc).lower():
+            logger.info("terminal websocket closed after disconnect sid=%s", session_id)
+        else:
+            logger.exception("terminal websocket runtime failure sid=%s", session_id)
     except Exception:
         logger.exception("terminal websocket failed sid=%s", session_id)
     finally:

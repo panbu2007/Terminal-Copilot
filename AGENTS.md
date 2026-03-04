@@ -59,6 +59,8 @@ When making changes, prefer the smallest verification that proves the modified p
   - status: `systemctl status terminal-copilot --no-pager`
   - logs: `journalctl -u terminal-copilot -n 200 --no-pager`
   - restart: `systemctl restart terminal-copilot`
+  - deploy update from Windows dev machine: `powershell -ExecutionPolicy Bypass -File scripts/deploy_server.ps1`
+  - deploy update from Linux/macOS shell: `bash scripts/deploy_server.sh`
 - Keep server-side secrets under `/opt/terminal_copilot/.secrets/`. Never commit `.secrets/` contents.
 - If you update deployment-critical code, verify both:
   - HTTP health endpoint
