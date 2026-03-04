@@ -5,16 +5,24 @@ import os
 import time
 import hashlib
 import platform as _platform
+from datetime import datetime, timezone
 from pathlib import Path
 import shlex
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+import asyncio
+import json
+from queue import Empty, Queue
+
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .executor import get_executor, get_executor_mode, set_executor_mode
 from .executor.base import ExecResult
 from .models import (
+    CommandSuggestion,
+    ExecutionPlan,
     ExecuteRequest,
     ExecuteResponse,
     ExecutorModeRequest,
@@ -28,14 +36,33 @@ from .models import (
     LlmTestRequest,
     LlmTestResponse,
     LlmTokenRequest,
+    PlanGenerateRequest,
+    PlanGenerateResponse,
     RiskLevel,
+    RunbookListResponse,
+    RunbookUpsertRequest,
     SessionResponse,
     SuggestRequest,
     SuggestResponse,
 )
-from .local_secrets import has_modelscope_token, read_modelscope_model, write_modelscope_model, write_modelscope_token
-from .planner import suggest
+from .llm.modelscope_client import PROVIDERS, normalize_provider, resolve_llm_config
+from .local_secrets import (
+    write_llm_base_url,
+    write_llm_model,
+    write_llm_provider,
+    write_llm_token,
+)
+from .plan_executor import (
+    approve_node,
+    cancel_plan,
+    get_plan_state,
+    skip_node,
+    start_plan_execution,
+)
+from .planner import build_execution_plan, suggest
 from .policy import evaluate
+from .rag import refresh_docs_cache
+from .rag_v2 import refresh_vector_cache
 from .store import STORE
 from .verifier import maybe_verify
 
@@ -59,11 +86,38 @@ def _runtime_platform() -> str:
         return "mac"
     return "linux"
 
+
 app = FastAPI(title="Terminal Copilot", version="0.1.0")
 
 logger = logging.getLogger("terminal_copilot")
 
+_PLAN_STORE: dict[str, ExecutionPlan] = {}
+RUNBOOK_DIR = REPO_ROOT / "docs" / "runbook"
+CUSTOM_RUNBOOK_DIR = RUNBOOK_DIR / "custom"
+
 _STARTED_AT_TS = time.time()
+
+
+def _setup_logging() -> None:
+    """Initialize app logger level from env.
+
+    Keep formatting/config delegated to uvicorn handlers; only tune levels here.
+    """
+    level_name = (os.getenv("TERMINAL_COPILOT_LOG_LEVEL", "INFO") or "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logger.setLevel(level)
+    # Keep sibling loggers aligned for richer agent/debug output.
+    for name in (
+        "terminal_copilot.agent",
+        "terminal_copilot.tools",
+        "terminal_copilot.orchestrator",
+        "terminal_copilot.executor_agent",
+        "terminal_copilot.llm",
+    ):
+        logging.getLogger(name).setLevel(level)
+
+
+_setup_logging()
 
 
 def _safe_read_git_head(repo_root: Path) -> str:
@@ -107,13 +161,89 @@ def _runtime_build_id() -> str:
     if sha:
         return sha
     # Fall back to asset fingerprints (works in Docker images without .git).
-    return _file_fingerprint(FRONTEND_STATIC_DIR / "app.js").split(" ", 1)[0].replace("sha256=", "")
+    return (
+        _file_fingerprint(FRONTEND_STATIC_DIR / "app.js")
+        .split(" ", 1)[0]
+        .replace("sha256=", "")
+    )
 
 
 def _llm_token_configured() -> bool:
-    return has_modelscope_token() or bool(os.getenv("MODELSCOPE_ACCESS_TOKEN")) or bool(
-        os.getenv("TERMINAL_COPILOT_MODELSCOPE_ACCESS_TOKEN")
-    )
+    return resolve_llm_config(require_token=True) is not None
+
+
+def _clip_for_log(text: str, limit: int = 200) -> str:
+    s = (text or "").replace("\n", "\\n").replace("\r", "\\r").strip()
+    if len(s) <= limit:
+        return s
+    return s[:limit] + "...(truncated)"
+
+
+def _refresh_knowledge_caches() -> None:
+    refresh_docs_cache()
+    refresh_vector_cache()
+
+
+def _safe_runbook_name(filename: str) -> str:
+    name = Path(str(filename or "").strip()).name
+    if not name:
+        raise HTTPException(status_code=400, detail="empty_filename")
+    if not name.lower().endswith(".md"):
+        raise HTTPException(status_code=400, detail="runbook_must_be_markdown")
+    if any(ch in name for ch in '<>:"/\\|?*'):
+        raise HTTPException(status_code=400, detail="invalid_filename")
+    return name
+
+
+def _extract_markdown_title(text: str, fallback: str) -> str:
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if line.startswith("#"):
+            return line.lstrip("#").strip() or fallback
+    return fallback
+
+
+@app.middleware("http")
+async def _request_log_middleware(request: Request, call_next):
+    # Focus on API observability; static file chatter is less useful for backend debugging.
+    should_log = request.url.path.startswith("/api/")
+    req_id = f"{int(time.time() * 1000) % 1000000:06d}"
+    start = time.perf_counter()
+
+    if should_log:
+        logger.info(
+            "[req:%s] --> %s %s from=%s ua=%s",
+            req_id,
+            request.method,
+            request.url.path,
+            getattr(request.client, "host", "-"),
+            _clip_for_log(request.headers.get("user-agent", ""), 120),
+        )
+
+    try:
+        response = await call_next(request)
+    except Exception:
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        logger.exception(
+            "[req:%s] !! %s %s failed in %sms",
+            req_id,
+            request.method,
+            request.url.path,
+            elapsed_ms,
+        )
+        raise
+
+    if should_log:
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        logger.info(
+            "[req:%s] <-- %s %s status=%s cost=%sms",
+            req_id,
+            request.method,
+            request.url.path,
+            response.status_code,
+            elapsed_ms,
+        )
+    return response
 
 
 @app.on_event("startup")
@@ -141,10 +271,10 @@ def _startup_llm_guide() -> None:
     if _llm_token_configured():
         return
     logger.warning(
-        "LLM 未配置 Token：请在页面右上角「LLM设置」中粘贴 Token 以启用 AI 功能；"
-        "或设置环境变量 MODELSCOPE_ACCESS_TOKEN / TERMINAL_COPILOT_MODELSCOPE_ACCESS_TOKEN。"
+        "LLM token not configured. Configure provider+token in LLM settings, "
+        "or set TERMINAL_COPILOT_LLM_PROVIDER / TERMINAL_COPILOT_LLM_ACCESS_TOKEN."
     )
-    logger.warning("（本地保存路径：.secrets/modelscope_access_token.txt，已加入 gitignore）")
+    logger.warning("local secret path: .secrets/llm_access_token.txt (gitignored)")
 
 
 def _is_running_in_container() -> bool:
@@ -227,7 +357,9 @@ def api_executor_set_mode(req: ExecutorModeRequest) -> ExecutorStatusResponse:
 def api_new_session() -> SessionResponse:
     session = STORE.get_or_create(None)
     # Initialize cwd early so the frontend can show it in the prompt.
-    local_root = Path(os.getenv("TERMINAL_COPILOT_LOCAL_ROOT", str(REPO_ROOT))).resolve()
+    local_root = Path(
+        os.getenv("TERMINAL_COPILOT_LOCAL_ROOT", str(REPO_ROOT))
+    ).resolve()
     if not session.cwd:
         session.cwd = str(local_root)
     return SessionResponse(
@@ -301,6 +433,14 @@ def api_export(session_id: str) -> ExportResponse:
 
 @app.post("/api/suggest", response_model=SuggestResponse)
 def api_suggest(req: SuggestRequest) -> SuggestResponse:
+    t0 = time.perf_counter()
+    logger.info(
+        "api_suggest start session=%s platform=%s exit_code=%s last=%s",
+        req.session_id,
+        req.platform,
+        req.last_exit_code,
+        _clip_for_log(req.last_command or "", 160),
+    )
     session = STORE.get_or_create(req.session_id)
 
     server_platform = _runtime_platform()
@@ -351,34 +491,205 @@ def api_suggest(req: SuggestRequest) -> SuggestResponse:
     )
     STORE.add_planned_steps(
         session,
-        items=[(s.title, s.command) for s in suggestions if s.command and s.command != "(auto)"],
+        items=[
+            (s.title, s.command)
+            for s in suggestions
+            if s.command and s.command != "(auto)"
+        ],
     )
-    return SuggestResponse(
+    res = SuggestResponse(
         session_id=session.id,
         suggestions=suggestions,
         steps=STORE.to_dict_steps(session),
+    )
+    logger.info(
+        "api_suggest done session=%s suggestions=%s cost=%sms",
+        session.id,
+        len(suggestions),
+        int((time.perf_counter() - t0) * 1000),
+    )
+    return res
+
+
+@app.post("/api/plan/generate", response_model=PlanGenerateResponse)
+def api_plan_generate(req: PlanGenerateRequest) -> PlanGenerateResponse:
+    session = STORE.get_or_create(req.session_id)
+
+    server_platform = _runtime_platform()
+    if req.platform != server_platform:
+        req.platform = server_platform  # type: ignore[assignment]
+
+    suggestions: list[CommandSuggestion]
+    if req.suggestions:
+        suggestions = req.suggestions
+    else:
+        suggest_req = SuggestRequest(
+            session_id=session.id,
+            last_command=req.intent,
+            last_exit_code=None,
+            last_stdout="",
+            last_stderr="",
+            platform=req.platform,
+            extra={},
+        )
+        suggestions = suggest(suggest_req)
+
+    plan: ExecutionPlan = build_execution_plan(
+        intent=req.intent, suggestions=suggestions
+    )
+    _PLAN_STORE[plan.id] = plan
+    STORE.add_event(
+        session,
+        kind="plan_generate",
+        payload={
+            "intent": req.intent[:200],
+            "nodes": str(len(plan.nodes)),
+            "edges": str(len(plan.edges)),
+        },
+    )
+    return PlanGenerateResponse(session_id=session.id, plan=plan)
+
+
+@app.post("/api/suggest/stream")
+async def api_suggest_stream(req: SuggestRequest) -> StreamingResponse:
+    """SSE 娴佸紡绔偣锛氬疄鏃舵帹閫?Multi-Agent 鍗忎綔杩涘害锛岀劧鍚庡彂閫佹渶缁堝缓璁€?
+
+    浜嬩欢鏍煎紡锛堟瘡琛?"data: <json>\\n\\n"锛夛細
+    - {"type": "agent_progress", "agent": "...", "status": "start|done|error", "message": "..."}
+    - {"type": "tool_call", "agent": "executor", "tool": "search_runbook|execute_command", "args": {...}}
+    - {"type": "suggestions", "session_id": "...", "suggestions": [...], "steps": [...]}
+    - {"type": "done"}
+    """
+    logger.info(
+        "api_suggest_stream start session=%s platform=%s exit_code=%s last=%s",
+        req.session_id,
+        req.platform,
+        req.last_exit_code,
+        _clip_for_log(req.last_command or "", 160),
+    )
+    server_platform = _runtime_platform()
+    if req.platform != server_platform:
+        try:
+            req.extra = dict(req.extra or {})
+            if req.platform:
+                req.extra.setdefault("client_platform", req.platform)
+        except Exception:
+            pass
+        req.platform = server_platform  # type: ignore[assignment]
+
+    q: Queue = Queue()
+    loop = asyncio.get_event_loop()
+
+    def _run_orchestrator() -> None:
+        """鍦ㄧ嚎绋嬩腑杩愯 Multi-Agent锛屼簨浠舵帹閫佸埌闃熷垪"""
+        try:
+            # 鍏堝皾璇曡鍒欏紩鎿?
+            rule_suggestions = suggest(req)
+            # 濡傛灉瑙勫垯寮曟搸宸叉湁缁撴灉锛堥潪 orchestrator 鏉ユ簮锛夛紝鐩存帴鎺ㄩ€?
+            if rule_suggestions and not any(
+                "orchestrator" in (s.tags or []) for s in rule_suggestions
+            ):
+                q.put({"type": "rule_suggestions"})
+                # 浠嶇劧鎺ㄩ€?agent 鍗忎綔缁撴灉鐢ㄤ簬鍙鍖?
+
+            # 璋冪敤 OrchestratorAgent锛堝甫浜嬩欢闃熷垪锛?
+            from .agents import OrchestratorAgent
+            from .llm.modelscope_client import modelscope_is_configured
+
+            if modelscope_is_configured():
+                orchestrator = OrchestratorAgent()
+                agent_suggestions = orchestrator.process(
+                    user_intent=req.last_command,
+                    platform=req.platform,
+                    last_stdout=req.last_stdout,
+                    last_stderr=req.last_stderr,
+                    last_exit_code=req.last_exit_code,
+                    event_queue=q,
+                )
+                final = agent_suggestions if agent_suggestions else rule_suggestions
+            else:
+                # 鏃?LLM token锛屽彧鍙戜竴鏉?orchestrator 鐘舵€佺劧鍚庣敤瑙勫垯缁撴灉
+                q.put(
+                    {
+                        "type": "agent_progress",
+                        "agent": "orchestrator",
+                        "status": "done",
+                        "message": "规则引擎模式（未配置 LLM Token）",
+                    }
+                )
+                final = rule_suggestions
+
+            session = STORE.get_or_create(req.session_id)
+            from .grounding import annotate_confidence
+
+            annotate_confidence(final)
+            suggestions_data = [s.model_dump() for s in final]
+            steps_data = STORE.to_dict_steps(session)
+            q.put(
+                {
+                    "type": "suggestions",
+                    "session_id": str(session.id),
+                    "suggestions": suggestions_data,
+                    "steps": steps_data,
+                }
+            )
+        except Exception as e:
+            q.put({"type": "error", "message": str(e)[:200]})
+        finally:
+            q.put(None)  # 缁撴潫鍝ㄥ叺
+
+    async def generate():
+        yield f"data: {json.dumps({'type': 'start'}, ensure_ascii=False)}\n\n"
+        future = loop.run_in_executor(None, _run_orchestrator)
+        while True:
+            try:
+                event = await asyncio.wait_for(
+                    loop.run_in_executor(None, q.get, True, 1.0),
+                    timeout=35.0,
+                )
+                if event is None:
+                    break
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+            except (asyncio.TimeoutError, Empty):
+                yield f"data: {json.dumps({'type': 'heartbeat'})}\n\n"
+        await future
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
 @app.get("/api/llm/status", response_model=LlmStatusResponse)
 def api_llm_status() -> LlmStatusResponse:
-    import os
-
     enabled_flag = os.getenv("TERMINAL_COPILOT_LLM_ENABLED", "auto").strip().lower()
+    cfg = resolve_llm_config(require_token=False)
+    token_ok = bool(cfg and cfg.access_token)
     enabled = enabled_flag in {"1", "true", "yes", "on"}
-    token_ok = _llm_token_configured()
     if enabled_flag == "auto":
         enabled = token_ok
 
-    base_url = os.getenv("TERMINAL_COPILOT_MODELSCOPE_BASE_URL", "https://api-inference.modelscope.cn/v1/")
-    model = os.getenv("TERMINAL_COPILOT_MODELSCOPE_MODEL") or read_modelscope_model() or "Qwen/Qwen2.5-Coder-32B-Instruct"
-    return LlmStatusResponse(
+    provider = cfg.provider if cfg else "modelscope"
+    base_url = cfg.base_url if cfg else PROVIDERS["modelscope"].default_base_url
+    model = cfg.model if cfg else PROVIDERS["modelscope"].default_model
+    res = LlmStatusResponse(
         enabled=enabled,
         has_token=token_ok,
-        provider="modelscope",
+        provider=provider,
         base_url=base_url,
         model=model,
     )
+    logger.debug(
+        "api_llm_status enabled=%s has_token=%s provider=%s model=%s base_url=%s",
+        res.enabled,
+        res.has_token,
+        res.provider,
+        res.model,
+        res.base_url,
+    )
+    return res
 
 
 @app.post("/api/llm/token")
@@ -386,58 +697,108 @@ def api_llm_set_token(req: LlmTokenRequest) -> dict[str, str]:
     token = (req.token or "").strip()
     if not token:
         raise HTTPException(status_code=400, detail="empty_token")
-    write_modelscope_token(token)
+    cfg = resolve_llm_config(require_token=False)
+    base_url = cfg.base_url if cfg else ""
+    if not base_url:
+        raise HTTPException(status_code=400, detail="empty_base_url")
+    write_llm_token(base_url, token)
+    logger.info(
+        "api_llm_set_token saved token_len=%s base_url=%s",
+        len(token),
+        _clip_for_log(base_url, 120),
+    )
     return {"status": "ok"}
 
 
 @app.post("/api/llm/config")
 def api_llm_set_config(req: LlmConfigRequest) -> dict[str, str]:
+    provider = normalize_provider(req.provider) if req.provider is not None else ""
     token = (req.token or "").strip() if req.token is not None else ""
     model = (req.model or "").strip() if req.model is not None else ""
+    base_url = (req.base_url or "").strip() if req.base_url is not None else ""
 
-    if req.token is None and req.model is None:
+    if (
+        req.provider is None
+        and req.token is None
+        and req.model is None
+        and req.base_url is None
+    ):
         raise HTTPException(status_code=400, detail="empty_config")
+
+    if req.provider is not None:
+        write_llm_provider(provider)
+        logger.info("api_llm_set_config updated provider=%s", provider)
 
     if req.token is not None:
         if not token:
             raise HTTPException(status_code=400, detail="empty_token")
-        write_modelscope_token(token)
+        resolved_base_url = resolve_llm_config(
+            provider_override=provider or None,
+            base_url_override=base_url or None,
+            require_token=False,
+        )
+        target_base_url = resolved_base_url.base_url if resolved_base_url else ""
+        if not target_base_url:
+            raise HTTPException(status_code=400, detail="empty_base_url")
+        write_llm_token(target_base_url, token)
+        logger.info(
+            "api_llm_set_config updated token token_len=%s base_url=%s",
+            len(token),
+            _clip_for_log(target_base_url, 120),
+        )
 
     if req.model is not None:
         if not model:
             raise HTTPException(status_code=400, detail="empty_model")
-        write_modelscope_model(model)
+        write_llm_model(model)
+        logger.info("api_llm_set_config updated model=%s", model)
+
+    if req.base_url is not None:
+        if not base_url:
+            raise HTTPException(status_code=400, detail="empty_base_url")
+        write_llm_base_url(base_url)
+        logger.info(
+            "api_llm_set_config updated base_url=%s", _clip_for_log(base_url, 120)
+        )
 
     return {"status": "ok"}
 
 
 @app.post("/api/llm/test", response_model=LlmTestResponse)
 def api_llm_test(req: LlmTestRequest) -> LlmTestResponse:
-    import time
     import json
     import urllib.error
     import urllib.request
 
-    provider = "modelscope"
-    base_url = os.getenv("TERMINAL_COPILOT_MODELSCOPE_BASE_URL", "https://api-inference.modelscope.cn/v1/")
-    if not base_url.endswith("/"):
-        base_url += "/"
+    provider_override = (
+        normalize_provider(req.provider) if req.provider is not None else None
+    )
+    cfg = resolve_llm_config(
+        provider_override=provider_override,
+        access_token_override=req.token,
+        model_override=req.model,
+        base_url_override=req.base_url,
+        require_token=False,
+    )
+    if cfg is None:
+        cfg = resolve_llm_config(require_token=False)
 
-    token = (req.token or "").strip() if req.token is not None else ""
-    if not token:
-        token = os.getenv("TERMINAL_COPILOT_MODELSCOPE_ACCESS_TOKEN") or os.getenv("MODELSCOPE_ACCESS_TOKEN") or ""
-    if not token:
-        from .local_secrets import read_modelscope_token
+    logger.info(
+        "api_llm_test start provider=%s model=%s token_provided=%s prompt_len=%s",
+        cfg.provider if cfg else "modelscope",
+        _clip_for_log((req.model or (cfg.model if cfg else "")), 120),
+        bool((req.token or "").strip()) or bool(cfg and cfg.access_token),
+        len((req.prompt or "").strip()),
+    )
 
-        token = read_modelscope_token() or ""
-
-    model = (req.model or "").strip() if req.model is not None else ""
-    if not model:
-        model = os.getenv("TERMINAL_COPILOT_MODELSCOPE_MODEL") or read_modelscope_model() or "Qwen/Qwen2.5-Coder-32B-Instruct"
+    provider = cfg.provider if cfg else "modelscope"
+    base_url = cfg.base_url if cfg else PROVIDERS["modelscope"].default_base_url
+    token = cfg.access_token if cfg else ""
+    model = cfg.model if cfg else PROVIDERS["modelscope"].default_model
 
     prompt = (req.prompt or "").strip() if req.prompt is not None else ""
     if not prompt:
-        prompt = "请只回复一个词：OK"
+        prompt = "Please only reply with one word: OK"
 
     if not token:
         return LlmTestResponse(
@@ -475,25 +836,27 @@ def api_llm_test(req: LlmTestRequest) -> LlmTestResponse:
         )
 
         try:
-            with urllib.request.urlopen(http_req, timeout=20.0) as resp:
+            with urllib.request.urlopen(
+                http_req, timeout=(cfg.timeout_seconds if cfg else 20.0)
+            ) as resp:
                 body = resp.read().decode("utf-8")
         except urllib.error.HTTPError as e:
-            detail = e.read().decode("utf-8", errors="ignore") if hasattr(e, "read") else ""
-            raise RuntimeError(f"modelscope_http_{getattr(e, 'code', 'error')}: {detail[:400]}") from e
+            detail = (
+                e.read().decode("utf-8", errors="ignore") if hasattr(e, "read") else ""
+            )
+            raise RuntimeError(
+                f"{provider}_http_{getattr(e, 'code', 'error')}: {detail[:400]}"
+            ) from e
         except urllib.error.URLError as e:
-            raise RuntimeError(f"modelscope_network_error: {e}") from e
+            raise RuntimeError(f"{provider}_network_error: {e}") from e
 
         data = json.loads(body)
-        text = (
-            data.get("choices", [{}])[0]
-            .get("message", {})
-            .get("content", "")
-        )
+        text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
         latency_ms = int((time.perf_counter() - start) * 1000)
         preview = (text or "").strip().replace("\n", " ")
         if len(preview) > 120:
-            preview = preview[:120] + "…"
-        return LlmTestResponse(
+            preview = preview[:120] + "..."
+        res = LlmTestResponse(
             ok=True,
             provider=provider,
             base_url=base_url,
@@ -502,9 +865,24 @@ def api_llm_test(req: LlmTestRequest) -> LlmTestResponse:
             message="ok",
             preview=preview,
         )
+        logger.info(
+            "api_llm_test ok provider=%s model=%s latency_ms=%s preview=%s",
+            provider,
+            model,
+            latency_ms,
+            _clip_for_log(preview, 120),
+        )
+        return res
     except Exception as e:
         latency_ms = int((time.perf_counter() - start) * 1000)
         msg = str(e)[:240]
+        logger.warning(
+            "api_llm_test failed provider=%s model=%s latency_ms=%s err=%s",
+            provider,
+            model,
+            latency_ms,
+            _clip_for_log(msg, 200),
+        )
         return LlmTestResponse(
             ok=False,
             provider=provider,
@@ -518,11 +896,20 @@ def api_llm_test(req: LlmTestRequest) -> LlmTestResponse:
 
 @app.post("/api/execute", response_model=ExecuteResponse)
 def api_execute(req: ExecuteRequest) -> ExecuteResponse:
+    t0 = time.perf_counter()
+    logger.info(
+        "api_execute start session=%s confirmed=%s cmd=%s",
+        req.session_id,
+        req.confirmed,
+        _clip_for_log(req.command or "", 220),
+    )
     session = STORE.get_or_create(req.session_id)
 
     # Maintain a per-session working directory for local execution.
     # Default to repo root; optionally restrict cd within TERMINAL_COPILOT_LOCAL_ROOT.
-    local_root = Path(os.getenv("TERMINAL_COPILOT_LOCAL_ROOT", str(REPO_ROOT))).resolve()
+    local_root = Path(
+        os.getenv("TERMINAL_COPILOT_LOCAL_ROOT", str(REPO_ROOT))
+    ).resolve()
     if not session.cwd:
         session.cwd = str(local_root)
 
@@ -536,7 +923,11 @@ def api_execute(req: ExecuteRequest) -> ExecuteResponse:
         s = cmd.strip()
         if not s:
             return None
-        if not (s.lower() == "cd" or s.lower().startswith("cd ") or s.lower().startswith("cd\t")):
+        if not (
+            s.lower() == "cd"
+            or s.lower().startswith("cd ")
+            or s.lower().startswith("cd\t")
+        ):
             return None
 
         # Best-effort parse for: cd <path> | cd /d <path>
@@ -555,7 +946,7 @@ def api_execute(req: ExecuteRequest) -> ExecuteResponse:
         cwd_path = Path(session.cwd).resolve()
         target = Path(raw_target)
         if not target.is_absolute():
-            target = (cwd_path / target)
+            target = cwd_path / target
         try:
             target = target.resolve()
         except Exception:
@@ -569,13 +960,23 @@ def api_execute(req: ExecuteRequest) -> ExecuteResponse:
         session.cwd = str(target)
         return ExecResult(0, "", "")
 
-    STORE.add_event(session, kind="execute_request", payload={"command": req.command, "confirmed": str(req.confirmed)})
+    STORE.add_event(
+        session,
+        kind="execute_request",
+        payload={"command": req.command, "confirmed": str(req.confirmed)},
+    )
 
     decision = evaluate(req.command)
     if decision.level == "block":
+        logger.warning(
+            "api_execute blocked_by_policy session=%s reason=%s cmd=%s",
+            session.id,
+            decision.reason,
+            _clip_for_log(req.command or "", 180),
+        )
         STORE.add_verification_step(
             session,
-            title="安全拦截",
+            title="瀹夊叏鎷︽埅",
             command=req.command,
             ok=False,
             detail=decision.reason,
@@ -591,6 +992,12 @@ def api_execute(req: ExecuteRequest) -> ExecuteResponse:
         )
 
     if decision.level == "warn" and not req.confirmed:
+        logger.info(
+            "api_execute confirmation_required session=%s reason=%s cmd=%s",
+            session.id,
+            decision.reason,
+            _clip_for_log(req.command or "", 180),
+        )
         STORE.add_verification_step(
             session,
             title="需要确认",
@@ -615,7 +1022,12 @@ def api_execute(req: ExecuteRequest) -> ExecuteResponse:
         executor = get_executor()
     else:
         executor = get_executor()
-        result = executor.run(req.command, confirmed=req.confirmed, cwd=session.cwd, session_id=str(session.id))
+        result = executor.run(
+            req.command,
+            confirmed=req.confirmed,
+            cwd=session.cwd,
+            session_id=str(session.id),
+        )
 
     STORE.add_event(
         session,
@@ -647,7 +1059,7 @@ def api_execute(req: ExecuteRequest) -> ExecuteResponse:
             ok=v.ok,
             detail=v.detail,
         )
-    return ExecuteResponse(
+    res = ExecuteResponse(
         session_id=session.id,
         command=req.command,
         exit_code=result.exit_code,
@@ -657,6 +1069,17 @@ def api_execute(req: ExecuteRequest) -> ExecuteResponse:
         cwd=session.cwd,
         steps=STORE.to_dict_steps(session),
     )
+    logger.info(
+        "api_execute done session=%s executor=%s exit=%s stdout_len=%s stderr_len=%s cwd=%s cost=%sms",
+        session.id,
+        executor.name,
+        result.exit_code,
+        len(result.stdout or ""),
+        len(result.stderr or ""),
+        session.cwd,
+        int((time.perf_counter() - t0) * 1000),
+    )
+    return res
 
 
 @app.post("/api/interrupt", response_model=InterruptResponse)
@@ -677,7 +1100,138 @@ def api_interrupt(req: InterruptRequest) -> InterruptResponse:
         kind="interrupt",
         payload={"ok": str(ok), "executor": ex.name},
     )
-    return InterruptResponse(ok=ok, message="interrupted" if ok else "no_running_process")
+    logger.info(
+        "api_interrupt session=%s ok=%s executor=%s", req.session_id, ok, ex.name
+    )
+    return InterruptResponse(
+        ok=ok, message="interrupted" if ok else "no_running_process"
+    )
+
+
+class PlanExecuteRequest(BaseModel):
+    session_id: str | None = None
+
+
+@app.post("/api/plan/{plan_id}/execute")
+def api_plan_execute(plan_id: str, req: PlanExecuteRequest) -> dict:
+    plan = _PLAN_STORE.get(plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="plan_not_found")
+    from uuid import UUID
+
+    sid = req.session_id
+    try:
+        session_uuid = UUID(sid) if sid else None
+    except ValueError:
+        session_uuid = None
+    session = STORE.get_or_create(session_uuid)
+    if not session.cwd:
+        local_root = Path(
+            os.getenv("TERMINAL_COPILOT_LOCAL_ROOT", str(REPO_ROOT))
+        ).resolve()
+        session.cwd = str(local_root)
+    start_plan_execution(plan, session_id=str(session.id), cwd=session.cwd)
+    return {"ok": True, "plan_id": plan.id}
+
+
+@app.get("/api/plan/{plan_id}/stream")
+async def api_plan_stream(
+    plan_id: str, session_id: str | None = None
+) -> StreamingResponse:
+    state = get_plan_state(plan_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="plan_state_not_found")
+
+    async def generate():
+        loop = asyncio.get_event_loop()
+        while True:
+            try:
+                event = await asyncio.wait_for(
+                    loop.run_in_executor(None, state.event_queue.get, True, 1.0),
+                    timeout=35.0,
+                )
+                if event is None:
+                    break
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+            except (asyncio.TimeoutError, Empty):
+                yield f"data: {json.dumps({'type': 'heartbeat'})}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/api/plan/{plan_id}/node/{node_id}/approve")
+def api_plan_node_approve(plan_id: str, node_id: str) -> dict:
+    ok = approve_node(plan_id, node_id)
+    return {"ok": ok}
+
+
+@app.post("/api/plan/{plan_id}/node/{node_id}/skip")
+def api_plan_node_skip(plan_id: str, node_id: str) -> dict:
+    ok = skip_node(plan_id, node_id)
+    return {"ok": ok}
+
+
+@app.post("/api/plan/{plan_id}/cancel")
+def api_plan_cancel(plan_id: str) -> dict:
+    ok = cancel_plan(plan_id)
+    return {"ok": ok}
+
+
+@app.get("/api/runbooks", response_model=RunbookListResponse)
+def api_runbooks_list() -> RunbookListResponse:
+    items = []
+    for path in sorted(RUNBOOK_DIR.rglob("*.md")) if RUNBOOK_DIR.exists() else []:
+        try:
+            text = path.read_text(encoding="utf-8")
+            stat = path.stat()
+            rel = path.resolve().relative_to(REPO_ROOT).as_posix()
+            items.append(
+                {
+                    "name": path.name,
+                    "title": _extract_markdown_title(text, path.stem),
+                    "source": rel,
+                    "size": stat.st_size,
+                    "updated_at": datetime.fromtimestamp(
+                        stat.st_mtime, timezone.utc
+                    ).isoformat(),
+                    "editable": CUSTOM_RUNBOOK_DIR in path.resolve().parents,
+                }
+            )
+        except Exception:
+            continue
+    return RunbookListResponse(items=items)
+
+
+@app.post("/api/runbooks")
+def api_runbooks_upsert(req: RunbookUpsertRequest) -> dict[str, str | bool]:
+    name = _safe_runbook_name(req.filename)
+    content = str(req.content or "")
+    if not content.strip():
+        raise HTTPException(status_code=400, detail="empty_content")
+    CUSTOM_RUNBOOK_DIR.mkdir(parents=True, exist_ok=True)
+    path = CUSTOM_RUNBOOK_DIR / name
+    path.write_text(content, encoding="utf-8")
+    _refresh_knowledge_caches()
+    logger.info("runbook upserted path=%s size=%s", path, len(content))
+    return {"ok": True, "source": path.resolve().relative_to(REPO_ROOT).as_posix()}
+
+
+@app.delete("/api/runbooks/{filename}")
+def api_runbooks_delete(filename: str) -> dict[str, bool]:
+    name = _safe_runbook_name(filename)
+    path = (CUSTOM_RUNBOOK_DIR / name).resolve()
+    if CUSTOM_RUNBOOK_DIR.resolve() not in path.parents:
+        raise HTTPException(status_code=400, detail="invalid_runbook_path")
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="runbook_not_found")
+    path.unlink()
+    _refresh_knowledge_caches()
+    logger.info("runbook deleted path=%s", path)
+    return {"ok": True}
 
 
 # Static frontend hosting
@@ -692,7 +1246,11 @@ class _NoCacheStaticFiles(StaticFiles):
 
 
 if FRONTEND_STATIC_DIR.exists():
-    app.mount("/static", _NoCacheStaticFiles(directory=str(FRONTEND_STATIC_DIR)), name="static")
+    app.mount(
+        "/static",
+        _NoCacheStaticFiles(directory=str(FRONTEND_STATIC_DIR)),
+        name="static",
+    )
 
 
 @app.get("/")

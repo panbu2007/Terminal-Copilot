@@ -33,6 +33,9 @@ class CommandSuggestion(BaseModel):
     requires_confirmation: bool = False
     tags: list[str] = Field(default_factory=list)
     citations: list[Citation] = Field(default_factory=list)
+    # 防幻觉置信度标签
+    confidence: str = ""  # "high" | "medium" | "low"
+    confidence_label: str = ""  # "✓ RAG验证" | "⚠ 未经验证" | "✗ 语法存疑"
 
 
 class SuggestRequest(BaseModel):
@@ -111,8 +114,10 @@ class LlmTokenRequest(BaseModel):
 
 
 class LlmConfigRequest(BaseModel):
+    provider: str | None = None
     token: str | None = None
     model: str | None = None
+    base_url: str | None = None
 
 
 class LlmStatusResponse(BaseModel):
@@ -124,8 +129,10 @@ class LlmStatusResponse(BaseModel):
 
 
 class LlmTestRequest(BaseModel):
+    provider: str | None = None
     token: str | None = None
     model: str | None = None
+    base_url: str | None = None
     prompt: str | None = None
 
 
@@ -150,3 +157,66 @@ class ExecutorStatusResponse(BaseModel):
     mode: ExecutorMode
     available: list[ExecutorMode]
     allow_local: bool
+
+
+PlanNodeType = Literal["diagnose", "command", "condition", "verify", "rollback", "end", "human"]
+PlanNodeStatus = Literal["pending", "running", "passed", "failed", "skipped", "awaiting_approval"]
+
+
+class PlanNode(BaseModel):
+    id: str
+    type: PlanNodeType = "command"
+    title: str
+    command: str = ""
+    risk_level: RiskLevel = RiskLevel.safe
+    grounded: bool = False
+    description: str = ""
+    citations: list[Citation] = Field(default_factory=list)
+    rollback: str = ""
+
+
+class PlanEdge(BaseModel):
+    source_id: str
+    target_id: str
+    condition: str = "success"
+    label: str = ""
+
+
+class ExecutionPlan(BaseModel):
+    id: str
+    intent: str
+    nodes: list[PlanNode] = Field(default_factory=list)
+    edges: list[PlanEdge] = Field(default_factory=list)
+    root_id: str = ""
+    generated_by: str = "planner"
+    created_at: str
+
+
+class PlanGenerateRequest(BaseModel):
+    session_id: UUID | None = None
+    intent: str = ""
+    platform: Literal["windows", "linux", "mac"] | None = None
+    suggestions: list[CommandSuggestion] = Field(default_factory=list)
+
+
+class PlanGenerateResponse(BaseModel):
+    session_id: UUID
+    plan: ExecutionPlan
+
+
+class RunbookFile(BaseModel):
+    name: str
+    title: str
+    source: str
+    size: int
+    updated_at: str
+    editable: bool = False
+
+
+class RunbookListResponse(BaseModel):
+    items: list[RunbookFile] = Field(default_factory=list)
+
+
+class RunbookUpsertRequest(BaseModel):
+    filename: str
+    content: str

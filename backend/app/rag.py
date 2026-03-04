@@ -70,6 +70,10 @@ def _load_docs() -> list[Doc]:
     return docs
 
 
+def refresh_docs_cache() -> None:
+    _load_docs.cache_clear()
+
+
 _KW_HEADER_RE = re.compile(r"^\s*(#{1,6}\s*)?(关键词|keywords)\s*[:：]?\s*$", re.IGNORECASE)
 
 

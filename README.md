@@ -65,7 +65,7 @@ python -m uvicorn backend.app.main:app --reload --port 8000
 
 - Token：`MODELSCOPE_ACCESS_TOKEN`（优先级最高）
 - Token（兼容）：`TERMINAL_COPILOT_MODELSCOPE_ACCESS_TOKEN`
-- 模型：`TERMINAL_COPILOT_MODELSCOPE_MODEL`（默认 `Qwen/Qwen2.5-Coder-32B-Instruct`）
+- 模型：`TERMINAL_COPILOT_MODELSCOPE_MODEL`（默认 `moonshotai/Kimi-K2.5`）
 - 代理开关：`TERMINAL_COPILOT_LLM_ENABLED=auto|true|false`（默认 `auto`）
 
 ### RAG
