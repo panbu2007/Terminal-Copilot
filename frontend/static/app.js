@@ -68,7 +68,7 @@ const runbookListEl = document.getElementById('runbookList');
 
 let currentExecutorMode = '';
 let ptySupported = false;
-let terminalMode = 'plan';
+let terminalMode = 'pty';
 let ptyWebSocket = null;
 let termDataDisposable = null;
 let termResizeDisposable = null;
