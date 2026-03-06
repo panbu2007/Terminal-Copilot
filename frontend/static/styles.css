@@ -493,15 +493,17 @@ body {
 .plan-edge.edge-failed   { stroke: #ef4444; stroke-width: 2.5; }
 
 .plan-edge-chip {
-  fill: rgba(9, 13, 28, 0.92);
-  stroke: rgba(255, 255, 255, 0.08);
+  fill: rgba(15, 23, 42, 0.62);
+  stroke: rgba(148, 163, 184, 0.28);
+  pointer-events: none;
 }
 
 .plan-edge-label {
-  fill: #c4cde4;
+  fill: rgba(226, 232, 240, 0.78);
   font-size: 9.5px;
   font-weight: 700;
   letter-spacing: 0.03em;
+  pointer-events: none;
 }
 
 /* Backward compat alias */

@@ -299,6 +299,9 @@ let latestRunbookItems = [];
 let currentPlanNodeOutputs = {};
 let currentPlanNodeStatuses = {};
 let currentPopoverNodeId = '';
+let pendingPlanApprovals = new Set();
+let planExecutionRoundId = '';
+let planExecutionStartedAt = 0;
 
 function initAgentState() {
   for (const item of AGENT_META) {
@@ -376,6 +379,99 @@ function switchSidePanel(name) {
 function setPlanUnread(hasUnread) {
   if (!planTabDotEl) return;
   planTabDotEl.classList.toggle('hidden', !hasUnread);
+}
+
+function isApprovalNode(node) {
+  return !!(node && (node.type === 'human' || node.risk_level === 'warn' || node.risk_level === 'block'));
+}
+
+function normalizeTerminalText(text) {
+  return String(text || '').replaceAll('\r\n', '\n').replaceAll('\r', '\n');
+}
+
+function writePlanTerminalLine(text, color = '') {
+  const msg = normalizeTerminalText(text);
+  if (!msg) return;
+  const body = msg.replaceAll('\n', '\r\n');
+  if (color) {
+    term.write(`\r\n${color}${body}\x1b[0m`);
+    return;
+  }
+  term.write(`\r\n${body}`);
+}
+
+function writePlanNodeStartToTerminal(command) {
+  const cmd = String(command || '').trim();
+  if (!cmd) return;
+  writePlanTerminalLine(`[PLAN] $ ${cmd}`, '\x1b[35m');
+}
+
+function writePlanNodeStdoutToTerminal(chunk) {
+  const out = normalizeTerminalText(chunk);
+  if (!out) return;
+  term.write(`\r\n${out.replaceAll('\n', '\r\n')}`);
+}
+
+function writePlanNodeDoneToTerminal(payload) {
+  if (!payload) return;
+  const stderr = normalizeTerminalText(payload.stderr || '');
+  if (stderr) {
+    term.write(`\r\n\x1b[31m${stderr.replaceAll('\n', '\r\n')}\x1b[0m`);
+  }
+  const status = String(payload.status || '').trim() || 'passed';
+  const exitCode = payload.exit_code;
+  if (status === 'failed' || stderr || typeof exitCode === 'number') {
+    const summary = `[PLAN] ${status}${typeof exitCode === 'number' ? ` (exit=${exitCode})` : ''}`;
+    writePlanTerminalLine(summary, status === 'failed' ? '\x1b[31m' : '\x1b[36m');
+  }
+}
+
+function echoIntentToTerminal(intent) {
+  const text = String(intent || '').trim();
+  if (!text) return;
+  if (terminalMode === 'pty') {
+    writePlanTerminalLine(`[INTENT] ${text}`, '\x1b[36m');
+    return;
+  }
+  redrawPromptLine(text);
+  term.write('\r\n');
+  currentLine = '';
+  cursorPos = 0;
+}
+
+function trackPlanNodeStart(nodeId, command) {
+  if (!planExecutionRoundId) {
+    planExecutionStartedAt = Date.now();
+    planExecutionRoundId = appendRound({
+      ts: planExecutionStartedAt,
+      command: currentPlanIntent || 'Execution Plan',
+      executor: 'plan',
+      exit_code: null,
+      stdout: '',
+      stderr: '',
+      verify_steps: [],
+      total_ms: null,
+      plan: { id: currentPlan && currentPlan.id ? currentPlan.id : '', title: currentPlanIntent || 'Execution Plan' },
+      next: { items: [] },
+    });
+  }
+  const existing = timelineRounds.find((item) => item && String(item.rid || '') === planExecutionRoundId);
+  const prevStdout = existing ? String(existing.stdout || '') : '';
+  updateRoundById(planExecutionRoundId, {
+    command: currentPlanIntent || 'Execution Plan',
+    stdout: `${prevStdout}${String(command || '').trim() ? `[PLAN] $ ${String(command || '').trim()}\n` : ''}`,
+  });
+  void nodeId;
+}
+
+function appendPlanRoundOutput(chunk, field = 'stdout') {
+  if (!planExecutionRoundId) return;
+  const id = String(field || 'stdout') === 'stderr' ? 'stderr' : 'stdout';
+  const normalized = normalizeTerminalText(chunk);
+  if (!normalized) return;
+  const existing = timelineRounds.find((item) => item && String(item.rid || '') === planExecutionRoundId);
+  const prev = existing ? String(existing[id] || '') : '';
+  updateRoundById(planExecutionRoundId, { [id]: `${prev}${normalized}` });
 }
 
 class PlanGraphRenderer {
@@ -519,7 +615,11 @@ class PlanGraphRenderer {
         .append('g')
         .attr('class', `plan-node node-type-${node.type} status-pending`)
         .attr('transform', `translate(${layoutNode.x - layoutNode.width / 2}, ${layoutNode.y - layoutNode.height / 2})`)
+        .on('mousedown', (event) => {
+          event.stopPropagation();
+        })
         .on('click', (event) => {
+          event.stopPropagation();
           if (typeof onNodeClick === 'function') onNodeClick(node, event.currentTarget);
         });
 
@@ -659,6 +759,8 @@ class PlanStreamClient {
     if (payload.type === 'heartbeat') return;
     if (payload.type === 'node_start') {
       currentPlanNodeStatuses[payload.node_id] = 'running';
+      trackPlanNodeStart(payload.node_id, payload.command || '');
+      writePlanNodeStartToTerminal(payload.command || '');
       this.renderer.updateNodeStatus(payload.node_id, 'running');
       this.renderer.resetEdgeStates();
       this.renderer.highlightEdgesFrom(payload.node_id, 'active');
@@ -668,6 +770,8 @@ class PlanStreamClient {
     }
     if (payload.type === 'node_stdout') {
       appendNodeStdout(payload.node_id, payload.chunk || '');
+      appendPlanRoundOutput(payload.chunk || '', 'stdout');
+      writePlanNodeStdoutToTerminal(payload.chunk || '');
       if (currentPopoverNodeId === payload.node_id) {
         const node = getCurrentPlanNode(payload.node_id);
         if (node) openNodePopover(node, null, false);
@@ -681,6 +785,8 @@ class PlanStreamClient {
         stderr: payload.stderr,
         exit_code: payload.exit_code,
       });
+      appendPlanRoundOutput(payload.stderr || '', 'stderr');
+      writePlanNodeDoneToTerminal(payload);
       this.renderer.updateNodeStatus(payload.node_id, payload.status || 'passed');
       this.renderer.resetEdgeStates();
       this.renderer.highlightEdgesFrom(payload.node_id, payload.status === 'failed' ? 'failed' : 'active');
@@ -705,6 +811,15 @@ class PlanStreamClient {
       currentPlanNodeStatuses[payload.node_id] = 'awaiting_approval';
       this.renderer.updateNodeStatus(payload.node_id, 'awaiting_approval');
       const node = currentPlan && Array.isArray(currentPlan.nodes) ? currentPlan.nodes.find((item) => item.id === payload.node_id) : null;
+      if (pendingPlanApprovals.has(payload.node_id)) {
+        void apiPlanApproveNode(this.planId, payload.node_id).then(() => {
+          currentPlanNodeStatuses[payload.node_id] = 'running';
+          this.renderer.updateNodeStatus(payload.node_id, 'running');
+        }).catch((err) => {
+          writeError(String(err.message || err));
+        });
+        return;
+      }
       if (node) openNodePopover(node, null, true);
       switchSidePanel('plan');
       return;
@@ -716,7 +831,16 @@ class PlanStreamClient {
     }
     if (payload.type === 'plan_done') {
       if (statusEl) statusEl.textContent = `计划执行完成: ${payload.summary || 'done'}`;
+      if (planExecutionRoundId) {
+        updateRoundById(planExecutionRoundId, {
+          total_ms: planExecutionStartedAt > 0 ? Date.now() - planExecutionStartedAt : null,
+        });
+      }
+      writePlanTerminalLine(`[PLAN] 执行完成: ${payload.summary || 'done'}`, '\x1b[36m');
       if (planBtnStopEl) planBtnStopEl.style.display = 'none';
+      pendingPlanApprovals.clear();
+      planExecutionRoundId = '';
+      planExecutionStartedAt = 0;
       this.close();
     }
   }
@@ -964,6 +1088,9 @@ function renderPlan(plan, intent) {
   currentPlanIntent = intent || (plan && plan.intent) || '';
   currentPlanNodeOutputs = {};
   currentPlanNodeStatuses = {};
+  pendingPlanApprovals = new Set();
+  planExecutionRoundId = '';
+  planExecutionStartedAt = 0;
   if (plan && Array.isArray(plan.nodes)) {
     for (const node of plan.nodes) currentPlanNodeStatuses[node.id] = 'pending';
   }
@@ -1085,6 +1212,7 @@ async function executeCurrentPlan() {
   if (!currentPlan || !currentPlan.id) return;
   statusEl.textContent = '执行计划中...';
   if (planBtnStopEl) planBtnStopEl.style.display = 'inline-flex';
+  writePlanTerminalLine(`[PLAN] 开始执行: ${currentPlanIntent || currentPlan.id}`, '\x1b[36m');
   await apiPlanExecute(currentPlan.id);
   closePlanStream();
   currentPlanStream = new PlanStreamClient(currentPlan.id, planRenderer);
@@ -1095,14 +1223,20 @@ async function executeCurrentPlan() {
 async function approveAllPlanNodes() {
   if (!currentPlan || !Array.isArray(currentPlan.nodes)) return;
   for (const node of currentPlan.nodes) {
-    if (node.type === 'human' || node.risk_level === 'warn' || node.risk_level === 'block') {
+    if (isApprovalNode(node)) {
+      pendingPlanApprovals.add(node.id);
       try {
-        await apiPlanApproveNode(currentPlan.id, node.id);
+        const res = await apiPlanApproveNode(currentPlan.id, node.id);
+        if (res && res.ok) {
+          currentPlanNodeStatuses[node.id] = 'running';
+          planRenderer.updateNodeStatus(node.id, 'running');
+        }
       } catch {
-        // ignore individual approval failures
+        // ignore individual approval failures before execution starts
       }
     }
   }
+  writePlanTerminalLine('[PLAN] 已记录全部批准，后续待审批节点会自动放行。', '\x1b[36m');
 }
 
 async function startIntentIteration(intent, { autoExecute = false } = {}) {
@@ -2698,6 +2832,7 @@ for (const btn of demoBtnEls) {
     const intent = DEMO_INTENTS[key];
     if (!intent) return;
     if (onboardingEl) onboardingEl.classList.add('hidden');
+    echoIntentToTerminal(intent);
     await startIntentIteration(intent, { autoExecute: true });
   });
 }
