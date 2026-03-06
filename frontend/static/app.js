@@ -1360,6 +1360,21 @@ const LLM_PROVIDER_OPTIONS = [
   { value: 'siliconflow', label: 'siliconflow（OpenAI-compatible）' },
 ];
 
+const LLM_PROVIDER_DEFAULTS = {
+  modelscope: {
+    baseUrl: 'https://api-inference.modelscope.cn/v1/',
+    model: 'moonshotai/Kimi-K2.5',
+  },
+  kimi: {
+    baseUrl: 'https://api.moonshot.cn/v1/',
+    model: 'kimi-k2.5',
+  },
+  siliconflow: {
+    baseUrl: 'https://api.siliconflow.cn/v1/',
+    model: 'moonshotai/Kimi-K2.5',
+  },
+};
+
 const LLM_PROVIDER_MODEL_PRESETS = {
   modelscope: [
     { value: 'moonshotai/Kimi-K2.5', label: 'moonshotai/Kimi-K2.5（默认）' },
@@ -1415,8 +1430,24 @@ function renderModelPresets(provider) {
   syncLlmModelPicker();
 }
 
-function setProviderSelection(provider, { refreshModels = true } = {}) {
+function getDefaultProviderBaseUrl(provider) {
+  const key = String(provider || 'modelscope').trim() || 'modelscope';
+  return (LLM_PROVIDER_DEFAULTS[key] && LLM_PROVIDER_DEFAULTS[key].baseUrl) || LLM_PROVIDER_DEFAULTS.modelscope.baseUrl;
+}
+
+function maybeSyncProviderBaseUrl(provider, previousProvider = '') {
+  if (!llmBaseUrlInput) return;
+  const nextDefault = getDefaultProviderBaseUrl(provider);
+  const prevDefault = getDefaultProviderBaseUrl(previousProvider || provider);
+  const current = String(llmBaseUrlInput.value || '').trim();
+  if (!current || current === prevDefault || current === nextDefault) {
+    llmBaseUrlInput.value = nextDefault;
+  }
+}
+
+function setProviderSelection(provider, { refreshModels = true, syncBaseUrl = true } = {}) {
   const value = String(provider || '').trim() || 'modelscope';
+  const previousValue = llmProviderSelect ? String(llmProviderSelect.value || '').trim() || 'modelscope' : 'modelscope';
   if (llmProviderSelect) llmProviderSelect.value = value;
   const items = llmProviderDropdownMenu ? Array.from(llmProviderDropdownMenu.querySelectorAll('[data-value]')) : [];
   let matched = null;
@@ -1433,6 +1464,7 @@ function setProviderSelection(provider, { refreshModels = true } = {}) {
       llmProviderDropdownBtn.textContent = value || '选择 Provider...';
     }
   }
+  if (syncBaseUrl) maybeSyncProviderBaseUrl(value, previousValue);
   if (refreshModels) renderModelPresets(value);
 }
 
