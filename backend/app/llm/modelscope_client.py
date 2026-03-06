@@ -79,6 +79,17 @@ PROVIDERS: dict[str, ProviderMeta] = {
         base_url_env_key="TERMINAL_COPILOT_SILICONFLOW_BASE_URL",
         timeout_env_key="TERMINAL_COPILOT_SILICONFLOW_TIMEOUT",
     ),
+    "custom": ProviderMeta(
+        name="custom",
+        default_base_url="",
+        default_model="",
+        token_env_keys=(
+            "TERMINAL_COPILOT_LLM_ACCESS_TOKEN",
+        ),
+        model_env_key="TERMINAL_COPILOT_LLM_MODEL",
+        base_url_env_key="TERMINAL_COPILOT_LLM_BASE_URL",
+        timeout_env_key="TERMINAL_COPILOT_LLM_TIMEOUT",
+    ),
 }
 
 PROVIDER_ALIASES = {
@@ -86,6 +97,7 @@ PROVIDER_ALIASES = {
     "moonshotai": "kimi",
     "ms": "modelscope",
     "sf": "siliconflow",
+    "openai-compatible": "custom",
 }
 
 

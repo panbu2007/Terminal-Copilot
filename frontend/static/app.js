@@ -1358,6 +1358,7 @@ const LLM_PROVIDER_OPTIONS = [
   { value: 'modelscope', label: 'modelscope（OpenAI-compatible）' },
   { value: 'kimi', label: 'kimi 官方 API（Moonshot）' },
   { value: 'siliconflow', label: 'siliconflow（OpenAI-compatible）' },
+  { value: 'custom', label: 'custom（自定义兼容接口）' },
 ];
 
 const LLM_PROVIDER_DEFAULTS = {
@@ -1372,6 +1373,10 @@ const LLM_PROVIDER_DEFAULTS = {
   siliconflow: {
     baseUrl: 'https://api.siliconflow.cn/v1/',
     model: 'moonshotai/Kimi-K2.5',
+  },
+  custom: {
+    baseUrl: '',
+    model: '',
   },
 };
 
@@ -1403,6 +1408,7 @@ const LLM_PROVIDER_MODEL_PRESETS = {
     { value: 'deepseek-ai/DeepSeek-R1', label: 'deepseek-ai/DeepSeek-R1' },
     { value: 'deepseek-ai/DeepSeek-V3', label: 'deepseek-ai/DeepSeek-V3' },
   ],
+  custom: [],
 };
 
 function renderDropdownItems(menuEl, items) {
@@ -1435,6 +1441,11 @@ function getDefaultProviderBaseUrl(provider) {
   return (LLM_PROVIDER_DEFAULTS[key] && LLM_PROVIDER_DEFAULTS[key].baseUrl) || LLM_PROVIDER_DEFAULTS.modelscope.baseUrl;
 }
 
+function getDefaultProviderModel(provider) {
+  const key = String(provider || 'modelscope').trim() || 'modelscope';
+  return (LLM_PROVIDER_DEFAULTS[key] && LLM_PROVIDER_DEFAULTS[key].model) || '';
+}
+
 function maybeSyncProviderBaseUrl(provider, previousProvider = '') {
   if (!llmBaseUrlInput) return;
   const nextDefault = getDefaultProviderBaseUrl(provider);
@@ -1445,7 +1456,17 @@ function maybeSyncProviderBaseUrl(provider, previousProvider = '') {
   }
 }
 
-function setProviderSelection(provider, { refreshModels = true, syncBaseUrl = true } = {}) {
+function maybeSyncProviderModel(provider, previousProvider = '') {
+  if (!llmModelInput) return;
+  const nextDefault = getDefaultProviderModel(provider);
+  const prevDefault = getDefaultProviderModel(previousProvider || provider);
+  const current = String(llmModelInput.value || '').trim();
+  if (!current || current === prevDefault || current === nextDefault) {
+    llmModelInput.value = nextDefault;
+  }
+}
+
+function setProviderSelection(provider, { refreshModels = true, syncBaseUrl = true, syncModel = false } = {}) {
   const value = String(provider || '').trim() || 'modelscope';
   const previousValue = llmProviderSelect ? String(llmProviderSelect.value || '').trim() || 'modelscope' : 'modelscope';
   if (llmProviderSelect) llmProviderSelect.value = value;
@@ -1466,6 +1487,10 @@ function setProviderSelection(provider, { refreshModels = true, syncBaseUrl = tr
   }
   if (syncBaseUrl) maybeSyncProviderBaseUrl(value, previousValue);
   if (refreshModels) renderModelPresets(value);
+  if (syncModel) {
+    maybeSyncProviderModel(value, previousValue);
+    syncLlmModelPicker();
+  }
 }
 
 const MODE = {
@@ -3147,9 +3172,7 @@ if (llmProviderDropdownMenu) {
     if (!target) return;
     const v = String(target.getAttribute('data-value') || '').trim();
     if (v) {
-      setProviderSelection(v);
-      if (llmModelInput) llmModelInput.value = '';
-      syncLlmModelPicker();
+      setProviderSelection(v, { syncModel: true });
     }
     setProviderDropdownOpen(false);
   });
