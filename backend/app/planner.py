@@ -91,11 +91,23 @@ def _materialize_plan_command(
 
     if mentions_port_8000 and ("ps -p <pid>" in cmd_lower or "kill <pid>" in cmd_lower or "kill -9 <pid>" in cmd_lower):
         if "ps -p <pid>" in cmd_lower:
-            return "sh -lc 'pid=$(lsof -tiTCP:8000 -sTCP:LISTEN | head -n 1); [ -n \"$pid\" ] && ps -p \"$pid\" -o pid,ppid,user,cmd || { echo \"port 8000 not listening\"; exit 1; }'"
+            return (
+                "sh -lc '"
+                + linux_pid_expr
+                + '; [ -n "$pid" ] && ps -p "$pid" -o pid,ppid,user,cmd || { echo "port 8000 not listening"; exit 1; }\''
+            )
         if "kill -9 <pid>" in cmd_lower:
-            return "sh -lc 'pid=$(lsof -tiTCP:8000 -sTCP:LISTEN | head -n 1); [ -n \"$pid\" ] && kill -9 \"$pid\" || { echo \"port 8000 not listening\"; exit 1; }'"
+            return (
+                "sh -lc '"
+                + linux_pid_expr
+                + '; [ -n "$pid" ] && kill -9 "$pid" || { echo "port 8000 not listening"; exit 1; }\''
+            )
         if "kill <pid>" in cmd_lower:
-            return "sh -lc 'pid=$(lsof -tiTCP:8000 -sTCP:LISTEN | head -n 1); [ -n \"$pid\" ] && kill \"$pid\" || { echo \"port 8000 not listening\"; exit 1; }'"
+            return (
+                "sh -lc '"
+                + linux_pid_expr
+                + '; [ -n "$pid" ] && kill "$pid" || { echo "port 8000 not listening"; exit 1; }\''
+            )
 
     if mentions_port_8000 and ("grep <pid>" in cmd_lower or "ps -ef" in cmd_lower or "ps aux" in cmd_lower):
         return (
