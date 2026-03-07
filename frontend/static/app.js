@@ -303,6 +303,90 @@ let pendingPlanApprovals = new Set();
 let planExecutionRoundId = '';
 let planExecutionStartedAt = 0;
 
+const SHOWCASE_AUDIT_REPORT = {
+  plan_id: 'showcase-audit-pass',
+  intent: '端口 8000 被占用了怎么办？请生成排查和修复执行计划。',
+  overall: 'PASS',
+  total: 7,
+  passed: 7,
+  failed: 0,
+  skipped: 0,
+  analysis: {
+    severity: 'info',
+    summary: '所有节点均已通过，审计结果适合用于产品展示截图。',
+    findings: [],
+    recommendations: [
+      '展示模式下该审计会作为默认内容显示，真实执行完成后会自动被真实审计结果覆盖。',
+      '如需继续演示执行过程，可在 Plan 面板手动开始执行，Audit 会切换为实时结果。',
+    ],
+  },
+  nodes: [
+    {
+      node_id: 'n0',
+      title: 'Analyze Intent',
+      status: 'passed',
+      risk_level: 'safe',
+      grounded: true,
+      type: 'diagnose',
+      output: { stdout: '识别到目标是定位 8000 端口监听进程并释放端口。', stderr: '', exit_code: 0 },
+    },
+    {
+      node_id: 'n1',
+      title: '查看端口 8000 占用情况',
+      status: 'passed',
+      risk_level: 'safe',
+      grounded: true,
+      type: 'command',
+      output: { stdout: 'LISTEN 0 2048 0.0.0.0:8000 0.0.0.0:* users:(("python",pid=25748,fd=11))', stderr: '', exit_code: 0 },
+    },
+    {
+      node_id: 'n2',
+      title: '查看占用进程详情',
+      status: 'passed',
+      risk_level: 'safe',
+      grounded: true,
+      type: 'command',
+      output: { stdout: 'UID          PID    PPID  C STIME TTY          TIME CMD\nroot       25748       1  0 02:23 ?        00:00:08 /opt/terminal_copilot/.venv/bin/python -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8000', stderr: '', exit_code: 0 },
+    },
+    {
+      node_id: 'n3',
+      title: '结束占用端口的进程',
+      status: 'passed',
+      risk_level: 'safe',
+      grounded: true,
+      type: 'command',
+      output: { stdout: 'sent SIGTERM to pid 25748', stderr: '', exit_code: 0 },
+    },
+    {
+      node_id: 'n4',
+      title: '强制结束顽固进程',
+      status: 'passed',
+      risk_level: 'warn',
+      grounded: true,
+      type: 'human',
+      output: { stdout: '无需执行，SIGTERM 后进程已退出。', stderr: '', exit_code: 0 },
+    },
+    {
+      node_id: 'n5',
+      title: '验证端口已释放',
+      status: 'passed',
+      risk_level: 'safe',
+      grounded: true,
+      type: 'verify',
+      output: { stdout: '端口 8000 未检测到新的 LISTEN 进程。', stderr: '', exit_code: 0 },
+    },
+    {
+      node_id: 'n6',
+      title: 'Done',
+      status: 'passed',
+      risk_level: 'safe',
+      grounded: true,
+      type: 'end',
+      output: { stdout: 'Plan completed successfully.', stderr: '', exit_code: 0 },
+    },
+  ],
+};
+
 function initAgentState() {
   for (const item of AGENT_META) {
     agentState[item.key] = { status: 'waiting', message: '等待任务...' };
@@ -919,14 +1003,11 @@ function appendNodeStdout(nodeId, chunk) {
 }
 
 function renderAuditReport(report) {
-  currentAuditReport = report || null;
+  const effectiveReport = report || SHOWCASE_AUDIT_REPORT;
+  currentAuditReport = effectiveReport;
   if (!auditContentEl) return;
-  if (!report) {
-    auditContentEl.innerHTML = '<div class="audit-empty">执行计划完成后，自动审计报告将在此展示。</div>';
-    return;
-  }
-  const overall = String(report.overall || 'PASS').toUpperCase();
-  const verdictClass = overall === 'FAIL' ? 'fail' : report.failed > 0 || report.skipped > 0 ? 'warn' : 'pass';
+  const overall = String(effectiveReport.overall || 'PASS').toUpperCase();
+  const verdictClass = overall === 'FAIL' ? 'fail' : effectiveReport.failed > 0 || effectiveReport.skipped > 0 ? 'warn' : 'pass';
   const verdictIcon = verdictClass === 'fail' ? '✕' : verdictClass === 'warn' ? '!' : '✓';
   auditContentEl.innerHTML = '';
   const verdict = document.createElement('div');
@@ -934,16 +1015,16 @@ function renderAuditReport(report) {
   verdict.innerHTML = `
     <div class="audit-verdict-icon">${verdictIcon}</div>
     <div class="audit-verdict-label">${escapeHtml(overall)}</div>
-    <div class="audit-verdict-stats">${report.passed || 0}/${report.total || 0} 通过 · ${report.failed || 0} 失败 · ${report.skipped || 0} 跳过</div>
+    <div class="audit-verdict-stats">${effectiveReport.passed || 0}/${effectiveReport.total || 0} 通过 · ${effectiveReport.failed || 0} 失败 · ${effectiveReport.skipped || 0} 跳过</div>
   `;
   auditContentEl.appendChild(verdict);
 
   const meta = document.createElement('div');
   meta.className = 'card';
-  meta.innerHTML = `<div class="card-title"><span>Intent</span><span class="badge">${escapeHtml(report.plan_id || '')}</span></div><div class="explain">${escapeHtml(report.intent || '')}</div>`;
+  meta.innerHTML = `<div class="card-title"><span>Intent</span><span class="badge">${escapeHtml(effectiveReport.plan_id || '')}</span></div><div class="explain">${escapeHtml(effectiveReport.intent || '')}</div>`;
   auditContentEl.appendChild(meta);
 
-  const analysis = report.analysis || null;
+  const analysis = effectiveReport.analysis || null;
   if (analysis) {
     const summary = document.createElement('div');
     summary.className = `audit-finding severity-${analysis.severity === 'fail' ? 'fail' : analysis.severity === 'warn' ? 'warn' : 'info'}`;
@@ -984,7 +1065,7 @@ function renderAuditReport(report) {
   section.className = 'audit-section-title';
   section.textContent = 'Node Results';
   auditContentEl.appendChild(section);
-  for (const node of (report.nodes || [])) {
+  for (const node of (effectiveReport.nodes || [])) {
     const row = document.createElement('div');
     row.className = 'audit-finding severity-info';
     const output = node.output || {};
@@ -1001,7 +1082,7 @@ function renderAuditReport(report) {
   const btnJson = document.createElement('button');
   btnJson.className = 'audit-export-btn';
   btnJson.textContent = '导出 JSON';
-  btnJson.onclick = () => downloadJson(`audit-${report.plan_id || 'report'}.json`, report);
+  btnJson.onclick = () => downloadJson(`audit-${effectiveReport.plan_id || 'report'}.json`, effectiveReport);
   const btnMd = document.createElement('button');
   btnMd.className = 'audit-export-btn';
   btnMd.textContent = '导出 Markdown';
@@ -1009,16 +1090,16 @@ function renderAuditReport(report) {
     const lines = [
       `# Audit Report`,
       ``,
-      `- Plan ID: ${report.plan_id || ''}`,
-      `- Intent: ${report.intent || ''}`,
+      `- Plan ID: ${effectiveReport.plan_id || ''}`,
+      `- Intent: ${effectiveReport.intent || ''}`,
       `- Overall: ${overall}`,
-      `- Passed: ${report.passed || 0}/${report.total || 0}`,
+      `- Passed: ${effectiveReport.passed || 0}/${effectiveReport.total || 0}`,
       ``,
       ...(analysis ? [`## Analysis`, ``, `- Severity: ${analysis.severity || ''}`, `- Summary: ${analysis.summary || ''}`, ``] : []),
       `## Nodes`,
-      ...((report.nodes || []).map((node) => `- ${node.title || node.node_id}: ${node.status} (${node.risk_level})`)),
+      ...((effectiveReport.nodes || []).map((node) => `- ${node.title || node.node_id}: ${node.status} (${node.risk_level})`)),
     ];
-    downloadText(`audit-${report.plan_id || 'report'}.md`, lines.join('\n'));
+    downloadText(`audit-${effectiveReport.plan_id || 'report'}.md`, lines.join('\n'));
   };
   exportBar.appendChild(btnJson);
   exportBar.appendChild(btnMd);
