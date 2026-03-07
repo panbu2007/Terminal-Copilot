@@ -507,6 +507,20 @@ class PlanGraphRenderer {
     this.container.classList.toggle('is-editing', this.editMode);
   }
 
+  nodeColors(type) {
+    const key = String(type || 'command').trim();
+    const map = {
+      diagnose: { stroke: '#60a5fa', fill: 'rgba(96, 165, 250, 0.12)' },
+      command: { stroke: '#a78bfa', fill: 'rgba(167, 139, 250, 0.12)' },
+      condition: { stroke: '#fbbf24', fill: 'rgba(251, 191, 36, 0.14)' },
+      verify: { stroke: '#34d399', fill: 'rgba(52, 211, 153, 0.12)' },
+      rollback: { stroke: '#f87171', fill: 'rgba(248, 113, 113, 0.12)' },
+      end: { stroke: '#94a3b8', fill: 'rgba(148, 163, 184, 0.12)' },
+      human: { stroke: '#fb923c', fill: 'rgba(251, 146, 60, 0.14)' },
+    };
+    return map[key] || map.command;
+  }
+
   render(plan, { onNodeClick } = {}) {
     this.plan = plan;
     if (!this.container) return;
@@ -625,30 +639,53 @@ class PlanGraphRenderer {
 
       const w = layoutNode.width;
       const h = layoutNode.height;
+      const palette = this.nodeColors(node.type);
       group.append('rect').attr('class', `risk-bar risk-${node.risk_level || 'safe'}`).attr('x', 0).attr('y', 0).attr('width', 6).attr('height', h).attr('rx', 6);
       if (node.type === 'condition') {
-        group.append('polygon').attr('class', 'node-bg').attr('points', `${w / 2},0 ${w},${h / 2} ${w / 2},${h} 0,${h / 2}`);
+        group.append('polygon')
+          .attr('class', 'node-bg')
+          .attr('points', `${w / 2},0 ${w},${h / 2} ${w / 2},${h} 0,${h / 2}`)
+          .attr('stroke', palette.stroke)
+          .attr('fill', palette.fill);
       } else if (node.type === 'end') {
-        group.append('rect').attr('class', 'node-bg').attr('x', 0).attr('y', 0).attr('rx', 26).attr('ry', 26).attr('width', w).attr('height', h);
+        group.append('rect')
+          .attr('class', 'node-bg')
+          .attr('x', 0)
+          .attr('y', 0)
+          .attr('rx', 26)
+          .attr('ry', 26)
+          .attr('width', w)
+          .attr('height', h)
+          .attr('stroke', palette.stroke)
+          .attr('fill', palette.fill);
       } else {
-        group.append('rect').attr('class', 'node-bg').attr('x', 0).attr('y', 0).attr('rx', 18).attr('ry', 18).attr('width', w).attr('height', h);
+        group.append('rect')
+          .attr('class', 'node-bg')
+          .attr('x', 0)
+          .attr('y', 0)
+          .attr('rx', 18)
+          .attr('ry', 18)
+          .attr('width', w)
+          .attr('height', h)
+          .attr('stroke', palette.stroke)
+          .attr('fill', palette.fill);
       }
       const iconWrap = group.append('g').attr('class', 'node-icon-wrap');
       iconWrap.append('circle').attr('class', 'node-icon-bg').attr('cx', 24).attr('cy', 24).attr('r', 12);
-      iconWrap.append('text').attr('class', 'node-icon').attr('x', 24).attr('y', 28).attr('text-anchor', 'middle').text(this.typeIcon(node.type));
-      group.append('text').attr('class', 'node-title').attr('x', 44).attr('y', 28).text(this.truncate(node.title || node.id, node.type === 'condition' ? 18 : 26));
+      iconWrap.append('text').attr('class', 'node-icon').attr('x', 24).attr('y', 28).attr('text-anchor', 'middle').attr('fill', '#f8fafc').text(this.typeIcon(node.type));
+      group.append('text').attr('class', 'node-title').attr('x', 44).attr('y', 28).attr('fill', '#f8fafc').text(this.truncate(node.title || node.id, node.type === 'condition' ? 18 : 26));
       if (node.type !== 'condition') {
-        group.append('text').attr('class', 'node-command').attr('x', 18).attr('y', 52).text(this.truncate(node.command || node.description || node.type, 34));
+        group.append('text').attr('class', 'node-command').attr('x', 18).attr('y', 52).attr('fill', '#dee6f9').text(this.truncate(node.command || node.description || node.type, 34));
       } else {
-        group.append('text').attr('class', 'node-command is-center').attr('x', w / 2).attr('y', 68).attr('text-anchor', 'middle').text(this.truncate(node.description || node.command || 'Condition', 18));
+        group.append('text').attr('class', 'node-command is-center').attr('x', w / 2).attr('y', 68).attr('text-anchor', 'middle').attr('fill', '#ffecb3').text(this.truncate(node.description || node.command || 'Condition', 18));
       }
       group.append('rect').attr('class', `node-pill pill-risk-${node.risk_level || 'safe'}`).attr('x', 16).attr('y', h - 28).attr('width', 52).attr('height', 16).attr('rx', 8);
-      group.append('text').attr('class', `node-pill-text`).attr('x', 42).attr('y', h - 16).attr('text-anchor', 'middle').text((node.risk_level || 'safe').toUpperCase());
+      group.append('text').attr('class', `node-pill-text`).attr('x', 42).attr('y', h - 16).attr('text-anchor', 'middle').attr('fill', '#d9e2f5').text((node.risk_level || 'safe').toUpperCase());
       const groundedLabel = node.grounded ? 'Grounded' : 'Unverified';
       const groundedWidth = node.grounded ? 74 : 84;
       group.append('rect').attr('class', `node-pill ${node.grounded ? 'pill-grounded-true' : 'pill-grounded-false'}`).attr('x', w - groundedWidth - 16).attr('y', h - 28).attr('width', groundedWidth).attr('height', 16).attr('rx', 8);
-      group.append('text').attr('class', 'node-pill-text grounded').attr('x', w - 16 - groundedWidth / 2).attr('y', h - 16).attr('text-anchor', 'middle').text(groundedLabel);
-      group.append('text').attr('class', 'badge-icon').attr('x', w - 18).attr('y', 28).attr('text-anchor', 'end').text('○');
+      group.append('text').attr('class', 'node-pill-text grounded').attr('x', w - 16 - groundedWidth / 2).attr('y', h - 16).attr('text-anchor', 'middle').attr('fill', '#d9e2f5').text(groundedLabel);
+      group.append('text').attr('class', 'badge-icon').attr('x', w - 18).attr('y', 28).attr('text-anchor', 'end').attr('fill', '#f8fafc').text('○');
       this.nodeEls.set(node.id, group);
     }
     requestAnimationFrame(() => this.fit());
@@ -1269,8 +1306,10 @@ async function startIntentIteration(intent, { autoExecute = false } = {}) {
         await dispatchTerminalCommand(s.command, false);
       }
     );
-    const plan = await generateExecutionPlan(normalized, sug.suggestions || []);
-    if (autoExecute && plan) await executeCurrentPlan();
+    await generateExecutionPlan(normalized, sug.suggestions || []);
+    // Natural-language intents should stop at plan generation.
+    // Actual execution must be a separate user action from the plan panel.
+    void autoExecute;
     setStatusReady();
   } catch (err) {
     statusEl.textContent = '错误';
@@ -2890,7 +2929,7 @@ for (const btn of demoBtnEls) {
     if (!intent) return;
     if (onboardingEl) onboardingEl.classList.add('hidden');
     echoIntentToTerminal(intent);
-    await startIntentIteration(intent, { autoExecute: true });
+    await startIntentIteration(intent, { autoExecute: false });
   });
 }
 if (onboardingCloseEl) onboardingCloseEl.addEventListener('click', () => onboardingEl && onboardingEl.classList.add('hidden'));
@@ -3289,7 +3328,7 @@ async function handlePlanModeInput(data) {
       term.write('\r\n');
       currentLine = '';
       cursorPos = 0;
-      await startIntentIteration(cmd, { autoExecute: MODE.get() === 'assist' });
+      await startIntentIteration(cmd, { autoExecute: false });
       prompt();
       return;
     }

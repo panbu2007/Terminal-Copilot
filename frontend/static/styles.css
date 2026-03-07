@@ -373,7 +373,7 @@ body {
 .plan-node.node-type-human .node-bg     { stroke: #fb923c; fill: rgba(251,146,60,0.10); }
 
 /* Status overlays */
-.plan-node.status-pending .node-bg { opacity: 0.5; }
+.plan-node.status-pending .node-bg { opacity: 0.9; }
 
 .plan-node.status-running .node-bg {
   stroke: #fbbf24;
