@@ -61,6 +61,10 @@ When making changes, prefer the smallest verification that proves the modified p
   - restart: `systemctl restart terminal-copilot`
   - deploy update from Windows dev machine: `powershell -ExecutionPolicy Bypass -File scripts/deploy_server.ps1`
   - deploy update from Linux/macOS shell: `bash scripts/deploy_server.sh`
+- Default expectation for coding agents:
+  - after each bug fix or user-requested code change, update the remote server in the same turn unless the user explicitly says not to deploy
+  - after deployment, run at least the server health check `curl http://127.0.0.1:8000/api/health`
+  - if normal git-based deploy is blocked by transient network issues, it is acceptable to sync only the changed files to `/opt/terminal_copilot/`, restart `terminal-copilot`, and report that fallback clearly
 - Keep server-side secrets under `/opt/terminal_copilot/.secrets/`. Never commit `.secrets/` contents.
 - If you update deployment-critical code, verify both:
   - HTTP health endpoint
