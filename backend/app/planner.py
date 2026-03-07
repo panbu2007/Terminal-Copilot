@@ -67,9 +67,12 @@ def _materialize_plan_command(
     title_lower = (title or "").lower()
     intent_lower = (intent or "").lower()
     mentions_port_8000 = "8000" in intent_lower or "8000" in cmd
+    cmd_lower = cmd.lower()
 
-    if mentions_port_8000 and ("tasklist" in cmd.lower() or "taskkill" in cmd.lower()):
-        if "tasklist" in cmd.lower():
+    linux_pid_expr = r"""pid=$(ss -ltnp 2>/dev/null | sed -n "s/.*:8000 .*pid=\([0-9][0-9]*\).*/\1/p" | head -n 1)"""
+
+    if mentions_port_8000 and ("tasklist" in cmd_lower or "taskkill" in cmd_lower):
+        if "tasklist" in cmd_lower:
             return (
                 'powershell -NoProfile -Command "$p = Get-NetTCPConnection -LocalPort 8000 '
                 '-State Listen -ErrorAction SilentlyContinue | Select-Object -First 1 '
@@ -77,7 +80,7 @@ def _materialize_plan_command(
                 '\\"port 8000 not listening\\"; exit 1 }; '
                 'Get-Process -Id $p | Select-Object Id,ProcessName,Path | Format-Table -AutoSize"'
             )
-        if "taskkill" in cmd.lower():
+        if "taskkill" in cmd_lower:
             return (
                 'powershell -NoProfile -Command "$p = Get-NetTCPConnection -LocalPort 8000 '
                 '-State Listen -ErrorAction SilentlyContinue | Select-Object -First 1 '
@@ -86,13 +89,30 @@ def _materialize_plan_command(
                 'Stop-Process -Id $p -Force; Write-Host (\\"stopped pid \\" + $p)"'
             )
 
-    if mentions_port_8000 and ("ps -p <pid>" in cmd.lower() or "kill <pid>" in cmd.lower() or "kill -9 <pid>" in cmd.lower()):
-        if "ps -p <pid>" in cmd.lower():
+    if mentions_port_8000 and ("ps -p <pid>" in cmd_lower or "kill <pid>" in cmd_lower or "kill -9 <pid>" in cmd_lower):
+        if "ps -p <pid>" in cmd_lower:
             return "sh -lc 'pid=$(lsof -tiTCP:8000 -sTCP:LISTEN | head -n 1); [ -n \"$pid\" ] && ps -p \"$pid\" -o pid,ppid,user,cmd || { echo \"port 8000 not listening\"; exit 1; }'"
-        if "kill -9 <pid>" in cmd.lower():
+        if "kill -9 <pid>" in cmd_lower:
             return "sh -lc 'pid=$(lsof -tiTCP:8000 -sTCP:LISTEN | head -n 1); [ -n \"$pid\" ] && kill -9 \"$pid\" || { echo \"port 8000 not listening\"; exit 1; }'"
-        if "kill <pid>" in cmd.lower():
+        if "kill <pid>" in cmd_lower:
             return "sh -lc 'pid=$(lsof -tiTCP:8000 -sTCP:LISTEN | head -n 1); [ -n \"$pid\" ] && kill \"$pid\" || { echo \"port 8000 not listening\"; exit 1; }'"
+
+    if mentions_port_8000 and ("grep <pid>" in cmd_lower or "ps -ef" in cmd_lower or "ps aux" in cmd_lower):
+        return (
+            "sh -lc '"
+            + linux_pid_expr
+            + '; [ -n "$pid" ] && ps -fp "$pid" || { echo "port 8000 not listening"; exit 1; }\''
+        )
+
+    if mentions_port_8000 and ("wmic process where" in cmd_lower or "processid=<pid>" in cmd_lower):
+        return (
+            'powershell -NoProfile -Command "$p = Get-NetTCPConnection -LocalPort 8000 '
+            '-State Listen -ErrorAction SilentlyContinue | Select-Object -First 1 '
+            '-ExpandProperty OwningProcess; if (-not $p) { Write-Host '
+            '\\"port 8000 not listening\\"; exit 1 }; '
+            'Get-CimInstance Win32_Process -Filter (\\"ProcessId = \\" + $p) '
+            '| Select-Object ProcessId,Name,ExecutablePath,CommandLine | Format-Table -AutoSize"'
+        )
 
     if mentions_port_8000 and "根据 pid 查看占用进程详细信息" in title_lower:
         return (
