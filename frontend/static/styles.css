@@ -1422,6 +1422,7 @@ button.danger {
     border-bottom: none;
     height: 100%;
     overflow: hidden;
+    padding-bottom: 52px; /* space for fixed tab bar */
   }
 
   /* Side pane hidden — content shown via bottom tab bar */
@@ -1435,11 +1436,6 @@ button.danger {
     border-left: none;
     border-right: none;
     border-bottom: none;
-  }
-
-  /* Push composer above the fixed tab bar */
-  .terminal-pane {
-    padding-bottom: 52px;
   }
 
   /* Hide desktop-only hints */
@@ -1540,7 +1536,7 @@ button.danger {
   position: fixed;
   inset: 0;
   background: rgba(0, 0, 0, 0.55);
-  z-index: 200;
+  z-index: 210;
 }
 
 .mobile-drawer-overlay.is-open { display: block; }
@@ -1553,7 +1549,7 @@ button.danger {
   width: 260px;
   background: #111831;
   border-left: 1px solid rgba(255, 255, 255, 0.08);
-  z-index: 201;
+  z-index: 211;
   display: flex;
   flex-direction: column;
   transform: translateX(100%);
