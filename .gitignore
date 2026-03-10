@@ -16,3 +16,7 @@ frontend/dist/
 
 # local secrets
 .secrets/
+
+# git worktrees
+.worktrees/
+.superpowers/
