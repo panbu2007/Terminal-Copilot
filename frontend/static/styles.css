@@ -1389,3 +1389,21 @@ button.danger {
     grid-template-columns: 1fr;
   }
 }
+
+/* ════════════════════════════════════════════════════════
+   MOBILE LAYOUT  ≤ 480px
+   ════════════════════════════════════════════════════════ */
+
+/* ── 1. Topbar: hide desktop-only items ───────────────── */
+@media (max-width: 480px) {
+  .topbar .modes,
+  .topbar .segmented,
+  .topbar .btn-export,
+  #llmGuide {
+    display: none !important;
+  }
+
+  .mobile-menu-btn {
+    display: flex !important;
+  }
+}
