@@ -2209,6 +2209,7 @@ let fitAddon = null;
 try {
   if (typeof FitAddon !== 'undefined' && FitAddon && FitAddon.FitAddon) {
     fitAddon = new FitAddon.FitAddon();
+    window.fitAddon = fitAddon;   // expose for mobile.js
     term.loadAddon(fitAddon);
     fitAddon.fit();
     window.addEventListener('resize', () => {
