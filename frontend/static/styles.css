@@ -1407,3 +1407,49 @@ button.danger {
     display: flex !important;
   }
 }
+
+/* ── 2. Layout: single column, side pane hidden ────────── */
+@media (max-width: 480px) {
+  .layout {
+    grid-template-columns: 1fr;
+    grid-template-rows: 1fr;
+    /* topbar 44px + tab bar 52px */
+    height: calc(100dvh - 44px - 52px);
+  }
+
+  .terminal-pane {
+    border-right: none;
+    border-bottom: none;
+    height: 100%;
+    overflow: hidden;
+  }
+
+  /* Side pane hidden — content shown via bottom tab bar */
+  .side-pane {
+    display: none;
+  }
+
+  /* Composer: remove rounded corners on mobile edges */
+  .composer {
+    border-radius: 0;
+    border-left: none;
+    border-right: none;
+    border-bottom: none;
+  }
+
+  /* Push composer above the fixed tab bar */
+  .terminal-pane {
+    padding-bottom: 52px;
+  }
+
+  /* Hide desktop-only hints */
+  .composer-guide,
+  .composer-shortcuts,
+  .terminal-toolbar-hint {
+    display: none;
+  }
+
+  .terminal-toolbar {
+    margin-bottom: 4px;
+  }
+}
