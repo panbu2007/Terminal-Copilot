@@ -31,6 +31,7 @@
   // ── State ────────────────────────────────────────────────
   let activeTab = 'terminal';
   let mobileWrapper = null;
+  let initialized = false;
 
   // ── Full-screen wrapper for non-terminal tabs ─────────────
   function ensureWrapper() {
@@ -195,19 +196,22 @@
 
   // ── Init ──────────────────────────────────────────────────
   function init() {
-    tabBtns.forEach(btn => btn.addEventListener('click', () => showTab(btn.dataset.tab)));
-    if (menuBtn)       menuBtn.addEventListener('click', openDrawer);
-    if (drawerClose)   drawerClose.addEventListener('click', closeDrawer);
-    if (drawerOverlay) drawerOverlay.addEventListener('click', closeDrawer);
-    wireDrawerButtons();
-    observePlanDot();
+    if (!initialized) {
+      tabBtns.forEach(btn => btn.addEventListener('click', () => showTab(btn.dataset.tab)));
+      if (menuBtn)       menuBtn.addEventListener('click', openDrawer);
+      if (drawerClose)   drawerClose.addEventListener('click', closeDrawer);
+      if (drawerOverlay) drawerOverlay.addEventListener('click', closeDrawer);
+      wireDrawerButtons();
+      observePlanDot();
+      initialized = true;
+    }
     showTab('terminal');
   }
 
   // ── Restore panels to side-pane on desktop ────────────────
   function teardown() {
     [timelinePanel, planPanel, auditPanel].forEach(panel => {
-      if (panel && mobileWrapper && panel.parentElement === mobileWrapper) {
+      if (panel && mobileWrapper && panel.parentElement === mobileWrapper && sidePaneEl) {
         sidePaneEl.appendChild(panel);
         panel.style.cssText = '';
       }
