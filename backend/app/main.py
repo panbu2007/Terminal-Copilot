@@ -5,6 +5,7 @@ import os
 import time
 import hashlib
 import platform as _platform
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 import shlex
@@ -98,6 +99,7 @@ logger = logging.getLogger("terminal_copilot")
 _PLAN_STORE: dict[str, ExecutionPlan] = {}
 RUNBOOK_DIR = REPO_ROOT / "docs" / "runbook"
 CUSTOM_RUNBOOK_DIR = RUNBOOK_DIR / "custom"
+_ENHANCE_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="suggest-enhance")
 
 _STARTED_AT_TS = time.time()
 
@@ -176,11 +178,155 @@ def _llm_token_configured() -> bool:
     return resolve_llm_config(require_token=True) is not None
 
 
+def _llm_enabled() -> bool:
+    enabled_flag = os.getenv("TERMINAL_COPILOT_LLM_ENABLED", "auto").strip().lower()
+    if enabled_flag == "auto":
+        return _llm_token_configured()
+    return enabled_flag in {"1", "true", "yes", "on"}
+
+
 def _clip_for_log(text: str, limit: int = 200) -> str:
     s = (text or "").replace("\n", "\\n").replace("\r", "\\r").strip()
     if len(s) <= limit:
         return s
     return s[:limit] + "...(truncated)"
+
+
+def _apply_policy_hints(suggestions: list[CommandSuggestion]) -> None:
+    for suggestion in suggestions:
+        if not suggestion.command or suggestion.command == "(auto)":
+            continue
+        decision = evaluate(suggestion.command)
+        if decision.level == "block":
+            suggestion.risk_level = RiskLevel.block
+            suggestion.requires_confirmation = False
+            suggestion.explanation = (
+                f"{suggestion.explanation}\nSafety notice: {decision.reason}"
+            ).strip()
+        elif decision.level == "warn":
+            suggestion.risk_level = RiskLevel.warn
+            suggestion.requires_confirmation = True
+            suggestion.explanation = (
+                f"{suggestion.explanation}\nSafety notice: {decision.reason}"
+            ).strip()
+
+
+def _run_suggestion_enhancement(
+    intent: str,
+    suggestions: list[CommandSuggestion],
+    event_queue: Queue,
+) -> None:
+    from .agents.rag_agent import RAGAgent
+    from .grounding import async_alignment_check
+
+    rag_agent = RAGAgent()
+    updated = [item.model_copy(deep=True) for item in suggestions]
+    event_queue.put(
+        {
+            "type": "agent_progress",
+            "agent": "rag",
+            "status": "start",
+            "message": "Enhancing citations for rule suggestions...",
+        }
+    )
+    event_queue.put(
+        {
+            "type": "agent_progress",
+            "agent": "safety",
+            "status": "start",
+            "message": "Checking semantic alignment...",
+        }
+    )
+
+    pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="suggest-augment")
+    rag_future = pool.submit(rag_agent.retrieve, intent, 3)
+    align_future = pool.submit(async_alignment_check, intent, updated)
+    try:
+        try:
+            citations = list(rag_future.result(timeout=10) or [])
+            event_queue.put(
+                {
+                    "type": "agent_progress",
+                    "agent": "rag",
+                    "status": "done",
+                    "message": f"Retrieved {len(citations)} extra citation(s).",
+                }
+            )
+        except Exception:
+            citations = []
+            event_queue.put(
+                {
+                    "type": "agent_progress",
+                    "agent": "rag",
+                    "status": "error",
+                    "message": "Citation enhancement unavailable.",
+                }
+            )
+
+        try:
+            updated = list(align_future.result(timeout=10) or updated)
+            matched = sum(1 for item in updated if item.alignment)
+            event_queue.put(
+                {
+                    "type": "agent_progress",
+                    "agent": "safety",
+                    "status": "done",
+                    "message": f"Alignment checked for {matched} suggestion(s).",
+                }
+            )
+        except Exception:
+            event_queue.put(
+                {
+                    "type": "agent_progress",
+                    "agent": "safety",
+                    "status": "error",
+                    "message": "Alignment check unavailable.",
+                }
+            )
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    for suggestion in updated:
+        if not suggestion.alignment:
+            continue
+        event_queue.put(
+            {
+                "type": "alignment_update",
+                "suggestion_id": suggestion.id,
+                "alignment": suggestion.alignment,
+                "alignment_reason": suggestion.alignment_reason,
+            }
+        )
+
+    for suggestion in suggestions:
+        existing = {
+            (citation.title, citation.snippet, citation.source)
+            for citation in (suggestion.citations or [])
+        }
+        extra = []
+        for citation in citations:
+            key = (
+                getattr(citation, "title", ""),
+                getattr(citation, "snippet", ""),
+                getattr(citation, "source", ""),
+            )
+            if key in existing:
+                continue
+            existing.add(key)
+            extra.append(citation)
+            if len(extra) >= 2:
+                break
+        if not extra:
+            continue
+        event_queue.put(
+            {
+                "type": "agent_enhancement",
+                "suggestion_id": suggestion.id,
+                "citations": [citation.model_dump() for citation in extra],
+                "confidence": suggestion.confidence,
+                "confidence_label": suggestion.confidence_label,
+            }
+        )
 
 
 def _refresh_knowledge_caches() -> None:
@@ -489,6 +635,7 @@ def api_suggest(req: SuggestRequest) -> SuggestResponse:
         req.platform = server_platform  # type: ignore[assignment]
 
     suggestions = suggest(req)
+    _apply_policy_hints(suggestions)
 
     # Observability: record whether LLM suggestions are present / error fallback happened
     if any(("llm" in (s.tags or [])) for s in suggestions):
@@ -501,19 +648,6 @@ def api_suggest(req: SuggestRequest) -> SuggestResponse:
             },
         )
 
-    # Apply policy hints to suggestions (consistent with execute-time guard)
-    for s in suggestions:
-        if not s.command or s.command == "(auto)":
-            continue
-        d = evaluate(s.command)
-        if d.level == "block":
-            s.risk_level = RiskLevel.block
-            s.requires_confirmation = False
-            s.explanation = f"{s.explanation}\n安全提示：{d.reason}"
-        elif d.level == "warn":
-            s.risk_level = RiskLevel.warn
-            s.requires_confirmation = True
-            s.explanation = f"{s.explanation}\n安全提示：{d.reason}"
     STORE.add_event(
         session,
         kind="suggest",
@@ -553,24 +687,22 @@ def api_plan_generate(req: PlanGenerateRequest) -> PlanGenerateResponse:
     if req.platform != server_platform:
         req.platform = server_platform  # type: ignore[assignment]
 
-    suggestions: list[CommandSuggestion]
-    if req.suggestions:
-        suggestions = req.suggestions
-    else:
-        suggest_req = SuggestRequest(
-            session_id=session.id,
-            last_command=req.intent,
-            last_exit_code=None,
-            last_stdout="",
-            last_stderr="",
-            platform=req.platform,
-            extra={},
-        )
-        suggestions = suggest(suggest_req)
+    from .agents.executor_agent import ExecutorAgent
+    from .agents.safety_agent import SafetyAgent
 
-    plan: ExecutionPlan = build_execution_plan(
-        intent=req.intent, suggestions=suggestions
-    )
+    executor_agent = ExecutorAgent()
+    safety_agent = SafetyAgent()
+
+    if req.suggestions:
+        plan = build_execution_plan(intent=req.intent, suggestions=req.suggestions)
+    elif req.intent and _llm_enabled():
+        plan = executor_agent.generate_dag(req.intent, platform=req.platform)
+        if plan is None:
+            plan = build_execution_plan(intent=req.intent, suggestions=[])
+    else:
+        plan = build_execution_plan(intent=req.intent, suggestions=[])
+
+    plan.pre_audit = safety_agent.pre_audit(plan, timeout=8.0)
     _PLAN_STORE[plan.id] = plan
     STORE.add_event(
         session,
@@ -611,12 +743,82 @@ async def api_suggest_stream(req: SuggestRequest) -> StreamingResponse:
             pass
         req.platform = server_platform  # type: ignore[assignment]
 
+    session = STORE.get_or_create(req.session_id)
     q: Queue = Queue()
     loop = asyncio.get_event_loop()
+    llm_enabled = _llm_enabled()
 
     def _run_orchestrator() -> None:
         """鍦ㄧ嚎绋嬩腑杩愯 Multi-Agent锛屼簨浠舵帹閫佸埌闃熷垪"""
         try:
+            rule_suggestions = suggest(req, allow_orchestrator=False)
+            _apply_policy_hints(rule_suggestions)
+
+            if rule_suggestions:
+                q.put(
+                    {
+                        "type": "agent_progress",
+                        "agent": "orchestrator",
+                        "status": "done",
+                        "message": "Rule suggestions returned immediately.",
+                    }
+                )
+                q.put(
+                    {
+                        "type": "suggestions",
+                        "session_id": str(session.id),
+                        "suggestions": [s.model_dump() for s in rule_suggestions],
+                        "steps": STORE.to_dict_steps(session),
+                    }
+                )
+                if llm_enabled:
+                    future = _ENHANCE_POOL.submit(
+                        _run_suggestion_enhancement,
+                        req.last_command,
+                        [s.model_copy(deep=True) for s in rule_suggestions],
+                        q,
+                    )
+                    try:
+                        future.result(timeout=22.0)
+                    except Exception:
+                        pass
+                return
+
+            if llm_enabled:
+                from .agents import OrchestratorAgent
+
+                orchestrator = OrchestratorAgent()
+                final = orchestrator.process(
+                    user_intent=req.last_command,
+                    platform=req.platform,
+                    last_stdout=req.last_stdout,
+                    last_stderr=req.last_stderr,
+                    last_exit_code=req.last_exit_code,
+                    event_queue=q,
+                    conversation_messages=req.conversation_messages,
+                )
+                _apply_policy_hints(final)
+            else:
+                q.put(
+                    {
+                        "type": "agent_progress",
+                        "agent": "orchestrator",
+                        "status": "done",
+                        "message": "No rule suggestions and LLM is unavailable.",
+                    }
+                )
+                final = []
+
+            q.put(
+                {
+                    "type": "suggestions",
+                    "session_id": str(session.id),
+                    "suggestions": [s.model_dump() for s in final],
+                    "steps": STORE.to_dict_steps(session),
+                }
+            )
+            return
+
             # 鍏堝皾璇曡鍒欏紩鎿?
             rule_suggestions = suggest(req)
             # 濡傛灉瑙勫垯寮曟搸宸叉湁缁撴灉锛堥潪 orchestrator 鏉ユ簮锛夛紝鐩存帴鎺ㄩ€?

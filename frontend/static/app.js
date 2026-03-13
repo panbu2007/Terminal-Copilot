@@ -1034,7 +1034,21 @@ function updatePlanOpBar() {
   planOpCountEl.textContent = `${currentPlan.nodes.length} nodes`;
   const warnCount = currentPlan.nodes.filter((node) => node.risk_level === 'warn').length;
   const blockCount = currentPlan.nodes.filter((node) => node.risk_level === 'block').length;
-  planPreAuditEl.textContent = `预审查: ${warnCount} 个 warn，${blockCount} 个 block，${currentPlan.nodes.filter((node) => node.grounded).length}/${currentPlan.nodes.length} 个节点有依据`;
+  const groundedCount = currentPlan.nodes.filter((node) => node.grounded).length;
+  const preAudit = currentPlan && currentPlan.pre_audit ? currentPlan.pre_audit : null;
+  const severity = String((preAudit && preAudit.severity) || '').trim().toLowerCase();
+  if (planPreAuditEl) {
+    if (severity) {
+      planPreAuditEl.dataset.severity = severity;
+    } else {
+      delete planPreAuditEl.dataset.severity;
+    }
+  }
+  if (preAudit && preAudit.summary) {
+    planPreAuditEl.textContent = `Pre-audit ${String(preAudit.severity || 'pass').toUpperCase()}: ${String(preAudit.summary || '')} · ${warnCount} warn · ${blockCount} block · ${groundedCount}/${currentPlan.nodes.length} grounded`;
+    return;
+  }
+  planPreAuditEl.textContent = `Pre-audit pending · ${warnCount} warn · ${blockCount} block · ${groundedCount}/${currentPlan.nodes.length} grounded`;
 }
 
 function renderNodePopoverBody(node, forceApproval = false) {
@@ -1300,6 +1314,19 @@ async function streamSuggestionsForIntent(intent, extraPayload = {}) {
           updateAgentProgress(payload.agent, 'running', `调用工具 ${payload.tool}`);
         } else if (payload.type === 'suggestions') {
           finalPayload = payload;
+          if (payload && payload.session_id) setSessionId(payload.session_id);
+          renderSteps(payload.steps || []);
+          renderLiveSuggestions(payload.suggestions || []);
+        } else if (payload.type === 'alignment_update') {
+          if (applyAlignmentUpdate(payload)) {
+            renderLiveSuggestions(lastSuggestionsCache);
+            finalPayload = syncFinalSuggestionPayload(finalPayload);
+          }
+        } else if (payload.type === 'agent_enhancement') {
+          if (applyAgentEnhancement(payload)) {
+            renderLiveSuggestions(lastSuggestionsCache);
+            finalPayload = syncFinalSuggestionPayload(finalPayload);
+          }
         } else if (payload.type === 'error') {
           throw new Error(payload.message || 'suggest_stream_failed');
         }
@@ -1314,7 +1341,7 @@ async function streamSuggestionsForIntent(intent, extraPayload = {}) {
       handleChunk(value);
     }
     currentSuggestStream = null;
-    return finalPayload || { suggestions: [], steps: [] };
+    return syncFinalSuggestionPayload(finalPayload) || { suggestions: [], steps: [] };
   } catch (err) {
     currentSuggestStream = null;
     throw err;
@@ -2178,6 +2205,115 @@ function confidenceBadge(suggestion) {
   return `<span class="badge confidence-${escapeHtml(level)}">${escapeHtml(label)}</span>`;
 }
 
+function alignmentBadge(suggestion) {
+  const level = String((suggestion && suggestion.alignment) || '').trim().toLowerCase();
+  if (!level) return '';
+  const labels = {
+    ok: 'aligned',
+    warn: 'check',
+    mismatch: 'mismatch',
+  };
+  return `<span class="badge alignment-${escapeHtml(level)}">${escapeHtml(labels[level] || level)}</span>`;
+}
+
+function alignmentSummary(suggestion) {
+  const level = String((suggestion && suggestion.alignment) || '').trim().toLowerCase();
+  if (!level) return '';
+  const reason = String((suggestion && suggestion.alignment_reason) || '').trim();
+  const label = level === 'ok' ? 'Aligned' : level === 'warn' ? 'Alignment Check' : 'Mismatch';
+  return reason ? `${label}: ${reason}` : label;
+}
+
+function insertSuggestionCommand(suggestion) {
+  if (!suggestion || suggestion.command === '(auto)') return;
+  insertTextAtCursor(suggestion.command);
+}
+
+async function executeSuggestion(suggestion) {
+  if (!suggestion || suggestion.command === '(auto)') return;
+  if (MODE.get() !== 'assist') {
+    writeInfo('当前是「只建议」模式，切换到「建议+执行」即可一键执行。');
+    return;
+  }
+  if (suggestion.risk_level === 'block') {
+    writeError('该命令被安全策略拦截（block）。');
+    return;
+  }
+  if (suggestion.requires_confirmation) {
+    setPendingConfirmation(
+      suggestion.command,
+      '风险等级为 warn，建议确认后再执行。'
+    );
+    writeInfoAbovePrompt('该建议需要确认：请在右侧点击「确认执行」。');
+    return;
+  }
+  await dispatchTerminalCommand(suggestion.command, false);
+}
+
+function cloneSuggestionsForPayload(items) {
+  if (!Array.isArray(items)) return [];
+  return items.map((item) => ({
+    ...item,
+    citations: Array.isArray(item && item.citations)
+      ? item.citations.map((citation) => ({ ...citation }))
+      : [],
+  }));
+}
+
+function renderLiveSuggestions(suggestions) {
+  renderSuggestions(suggestions || [], insertSuggestionCommand, executeSuggestion);
+}
+
+function syncFinalSuggestionPayload(finalPayload) {
+  if (!finalPayload) return finalPayload;
+  return {
+    ...finalPayload,
+    suggestions: cloneSuggestionsForPayload(lastSuggestionsCache),
+  };
+}
+
+function updateSuggestionCache(suggestionId, updater) {
+  const id = String(suggestionId || '').trim();
+  if (!id || !Array.isArray(lastSuggestionsCache) || !lastSuggestionsCache.length) return false;
+  let changed = false;
+  lastSuggestionsCache = lastSuggestionsCache.map((item) => {
+    if (!item || String(item.id || '') !== id) return item;
+    const next = updater({ ...item, citations: Array.isArray(item.citations) ? item.citations.map((citation) => ({ ...citation })) : [] });
+    changed = true;
+    return next;
+  });
+  return changed;
+}
+
+function applyAlignmentUpdate(payload) {
+  if (!payload) return false;
+  return updateSuggestionCache(payload.suggestion_id, (item) => ({
+    ...item,
+    alignment: String(payload.alignment || '').trim(),
+    alignment_reason: String(payload.alignment_reason || '').trim(),
+  }));
+}
+
+function applyAgentEnhancement(payload) {
+  if (!payload) return false;
+  return updateSuggestionCache(payload.suggestion_id, (item) => {
+    const existing = Array.isArray(item.citations) ? item.citations.map((citation) => ({ ...citation })) : [];
+    const seen = new Set(existing.map((citation) => `${citation.title || ''}::${citation.snippet || ''}::${citation.source || ''}`));
+    for (const citation of Array.isArray(payload.citations) ? payload.citations : []) {
+      const key = `${citation && citation.title ? citation.title : ''}::${citation && citation.snippet ? citation.snippet : ''}::${citation && citation.source ? citation.source : ''}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      existing.push({ ...citation });
+    }
+    return {
+      ...item,
+      citations: existing,
+      confidence: String(payload.confidence || item.confidence || ''),
+      confidence_label: String(payload.confidence_label || item.confidence_label || ''),
+    };
+  });
+}
+
 function renderSuggestions(suggestions, insertFn, executeFn) {
   clearSuggestions();
   lastSuggestionsCache = Array.isArray(suggestions) ? suggestions : [];
@@ -2208,7 +2344,7 @@ function renderSuggestions(suggestions, insertFn, executeFn) {
     title.className = 'card-title';
     const confirmTag = s.requires_confirmation ? ' · 需确认' : '';
     const agentTag = s.agent ? ` 路 ${escapeHtml(s.agent)}` : '';
-    title.innerHTML = `<span>${escapeHtml(s.title)}${agentTag}${confirmTag}</span><span class="badge-row"><span class="badge ${badgeClass(s.risk_level)}">${escapeHtml(s.risk_level)}</span>${confidenceBadge(s)}</span>`;
+    title.innerHTML = `<span>${escapeHtml(s.title)}${agentTag}${confirmTag}</span><span class="badge-row"><span class="badge ${badgeClass(s.risk_level)}">${escapeHtml(s.risk_level)}</span>${confidenceBadge(s)}${alignmentBadge(s)}</span>`;
 
     const cmd = document.createElement('div');
     cmd.className = 'cmd';
@@ -2251,6 +2387,7 @@ function renderSuggestions(suggestions, insertFn, executeFn) {
       addExplainLine('Risk', s.risk);
       addExplainLine('Rollback', s.rollback);
       addExplainLine('Verify', s.verify);
+      addExplainLine('Alignment', alignmentSummary(s));
 
       if (Array.isArray(s.citations) && s.citations.length > 0) {
         for (const c of s.citations.slice(0, 3)) {

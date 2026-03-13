@@ -144,8 +144,183 @@ def _materialize_plan_command(
     return cmd
 
 
+def _is_port_in_use_scenario(intent: str, suggestions: list[CommandSuggestion]) -> bool:
+    intent_lower = (intent or "").lower()
+    if "8000" not in intent_lower and not any("8000" in (s.command or "") for s in suggestions):
+        return False
+
+    for suggestion in suggestions:
+        suggestion_id = (suggestion.id or "").lower()
+        command = (suggestion.command or "").lower()
+        if suggestion_id.startswith(("intent-port-", "port-")):
+            return True
+        if any(
+            token in command
+            for token in ("ss -ltnp", "netstat -ano", "findstr :8000", "lsof")
+        ) and "8000" in command:
+            return True
+    return False
+
+
+def _port_plan_platform(suggestions: list[CommandSuggestion]) -> str:
+    for suggestion in suggestions:
+        suggestion_id = (suggestion.id or "").lower()
+        command = (suggestion.command or "").lower()
+        if "windows" in suggestion_id or "netstat" in command or "findstr" in command:
+            return "windows"
+        if "mac" in suggestion_id or "lsof" in command:
+            return "mac"
+    return "linux"
+
+
+def _build_port_in_use_plan(*, intent: str, suggestions: list[CommandSuggestion]) -> ExecutionPlan:
+    platform = _port_plan_platform(suggestions)
+    base_citations = list((suggestions[0].citations if suggestions else []) or [])
+
+    if platform == "windows":
+        detect_command = "netstat -ano | findstr :8000"
+        inspect_command = (
+            'powershell -NoProfile -Command "$p = Get-NetTCPConnection -LocalPort 8000 '
+            '-State Listen -ErrorAction SilentlyContinue | Select-Object -First 1 '
+            '-ExpandProperty OwningProcess; if (-not $p) { Write-Host '
+            '\\"port 8000 not listening\\"; exit 1 }; '
+            'Get-Process -Id $p | Select-Object Id,ProcessName,Path | Format-Table -AutoSize"'
+        )
+        kill_command = (
+            'powershell -NoProfile -Command "$p = Get-NetTCPConnection -LocalPort 8000 '
+            '-State Listen -ErrorAction SilentlyContinue | Select-Object -First 1 '
+            '-ExpandProperty OwningProcess; if (-not $p) { Write-Host '
+            '\\"port 8000 not listening\\"; exit 1 }; '
+            'Stop-Process -Id $p -Force; Write-Host (\\"stopped pid \\" + $p)"'
+        )
+        verify_command = detect_command
+    elif platform == "mac":
+        detect_command = "lsof -nP -iTCP:8000 -sTCP:LISTEN"
+        inspect_command = (
+            "sh -lc 'pid=$(lsof -nP -t -iTCP:8000 -sTCP:LISTEN | head -n 1); "
+            "[ -n \"$pid\" ] && ps -p \"$pid\" -o pid=,ppid=,user=,command= "
+            "|| { echo \"port 8000 not listening\"; exit 1; }'"
+        )
+        kill_command = (
+            "sh -lc 'pid=$(lsof -nP -t -iTCP:8000 -sTCP:LISTEN | head -n 1); "
+            "[ -n \"$pid\" ] && kill \"$pid\" || { echo \"port 8000 not listening\"; exit 1; }'"
+        )
+        verify_command = detect_command
+    else:
+        detect_command = "ss -ltnp | grep :8000"
+        inspect_command = (
+            "sh -lc 'pid=$(ss -ltnp 2>/dev/null | sed -n "
+            "\"s/.*:8000 .*pid=\\([0-9][0-9]*\\).*/\\1/p\" | head -n 1); "
+            "[ -n \"$pid\" ] && ps -fp \"$pid\" || { echo \"port 8000 not listening\"; exit 1; }'"
+        )
+        kill_command = (
+            "sh -lc 'pid=$(ss -ltnp 2>/dev/null | sed -n "
+            "\"s/.*:8000 .*pid=\\([0-9][0-9]*\\).*/\\1/p\" | head -n 1); "
+            "[ -n \"$pid\" ] && kill \"$pid\" || { echo \"port 8000 not listening\"; exit 1; }'"
+        )
+        verify_command = detect_command
+
+    root_id = "n0"
+    end_id = "n6"
+    nodes = [
+        PlanNode(
+            id=root_id,
+            type="diagnose",
+            title="Analyze Intent",
+            command="",
+            risk_level=RiskLevel.safe,
+            grounded=False,
+            description=intent or "Investigate port 8000 occupancy.",
+            citations=[],
+        ),
+        PlanNode(
+            id="n1",
+            type="command",
+            title="Check whether port 8000 is occupied",
+            command=detect_command,
+            risk_level=RiskLevel.safe,
+            grounded=bool(base_citations),
+            description="Detect whether a listener is already bound to port 8000.",
+            citations=list(base_citations),
+        ),
+        PlanNode(
+            id="n2",
+            type="command",
+            title="Inspect the occupying process",
+            command=inspect_command,
+            risk_level=RiskLevel.safe,
+            grounded=False,
+            description="Show the process details before any stop action.",
+            citations=[],
+        ),
+        PlanNode(
+            id="n3",
+            type="human",
+            title="Confirm whether to stop the occupying process",
+            command="",
+            risk_level=RiskLevel.safe,
+            grounded=False,
+            description="Require explicit approval before terminating the process.",
+            citations=[],
+        ),
+        PlanNode(
+            id="n4",
+            type="command",
+            title="Stop the occupying process",
+            command=kill_command,
+            risk_level=RiskLevel.warn,
+            grounded=False,
+            description="Terminate the process holding port 8000.",
+            citations=[],
+            rollback="Restart the stopped service if it was required.",
+        ),
+        PlanNode(
+            id="n5",
+            type="verify",
+            title="Verify whether port 8000 is now free",
+            command=verify_command,
+            risk_level=RiskLevel.safe,
+            grounded=bool(base_citations),
+            description="Re-check the port after the stop action.",
+            citations=list(base_citations),
+        ),
+        PlanNode(
+            id=end_id,
+            type="end",
+            title="Done",
+            command="",
+            risk_level=RiskLevel.safe,
+            grounded=True,
+            description="Port workflow completed.",
+            citations=[],
+        ),
+    ]
+    edges = [
+        PlanEdge(source_id=root_id, target_id="n1", condition="success", label="next"),
+        PlanEdge(source_id="n1", target_id="n2", condition="success", label="occupied"),
+        PlanEdge(source_id="n1", target_id=end_id, condition="failure", label="free"),
+        PlanEdge(source_id="n2", target_id="n3", condition="success", label="reviewed"),
+        PlanEdge(source_id="n3", target_id="n4", condition="success", label="approved"),
+        PlanEdge(source_id="n4", target_id="n5", condition="success", label="verify"),
+        PlanEdge(source_id="n5", target_id=end_id, condition="success", label="done"),
+    ]
+
+    return ExecutionPlan(
+        id=str(uuid4()),
+        intent=intent or "",
+        nodes=nodes,
+        edges=edges,
+        root_id=root_id,
+        generated_by="planner",
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+
 def build_execution_plan(*, intent: str, suggestions: list[CommandSuggestion]) -> ExecutionPlan:
     """Build a minimal DAG execution plan from ordered command suggestions."""
+
+    if _is_port_in_use_scenario(intent, suggestions):
+        return _build_port_in_use_plan(intent=intent, suggestions=suggestions)
 
     nodes: list[PlanNode] = []
     edges: list[PlanEdge] = []
@@ -230,7 +405,7 @@ def build_execution_plan(*, intent: str, suggestions: list[CommandSuggestion]) -
     )
 
 
-def suggest(req: SuggestRequest) -> list[CommandSuggestion]:
+def suggest(req: SuggestRequest, *, allow_orchestrator: bool = True) -> list[CommandSuggestion]:
     last = (req.last_command or "").strip()
     stdout = req.last_stdout or ""
     stderr = req.last_stderr or ""
@@ -547,7 +722,7 @@ def suggest(req: SuggestRequest) -> list[CommandSuggestion]:
 
     # If rules didn't produce any suggestions, fall back to Multi-Agent Orchestrator.
     # OrchestratorAgent: DiagAgent + RAGAgent (parallel) → ExecutorAgent → SafetyAgent
-    if not suggestions and llm_enabled and last:
+    if allow_orchestrator and not suggestions and llm_enabled and last:
         try:
             from .agents import OrchestratorAgent
 

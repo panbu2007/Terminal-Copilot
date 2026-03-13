@@ -323,6 +323,10 @@ body {
   color: var(--muted);
 }
 
+.plan-preaudit[data-severity="pass"] { color: var(--good); }
+.plan-preaudit[data-severity="warn"] { color: var(--warn); }
+.plan-preaudit[data-severity="fail"] { color: var(--bad); }
+
 /* ── Plan Graph Container ───────────────────────────── */
 .plan-graph {
   border: 1px solid var(--border);
@@ -914,6 +918,9 @@ body {
 .badge.confidence-high { color: var(--good); opacity: 0.85; }
 .badge.confidence-medium { color: var(--warn); opacity: 0.85; }
 .badge.confidence-low { color: var(--bad); opacity: 0.85; }
+.badge.alignment-ok { color: var(--good); opacity: 0.85; }
+.badge.alignment-warn { color: var(--warn); opacity: 0.85; }
+.badge.alignment-mismatch { color: var(--bad); opacity: 0.85; }
 
 .cmd {
   margin-top: 6px;

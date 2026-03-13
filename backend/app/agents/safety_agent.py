@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
+import re as _re
 from typing import Any
+from typing import TYPE_CHECKING
 
 from .base import AgentMessage, BaseAgent
+
+if TYPE_CHECKING:
+    from ..models import ExecutionPlan
 
 
 class SafetyAgent(BaseAgent):
@@ -96,6 +102,110 @@ class SafetyAgent(BaseAgent):
             "findings": findings,
             "recommendations": recommendations,
         }
+
+    def pre_audit(self, plan: "ExecutionPlan", *, timeout: float = 8.0) -> dict[str, Any]:
+        """Run a best-effort LLM pre-audit against a plan before execution."""
+
+        fallback: dict[str, Any] = {
+            "severity": "pass",
+            "summary": "Pre-audit skipped (LLM unavailable)",
+            "findings": [],
+            "recommendations": [],
+        }
+
+        try:
+            from ..llm.modelscope_client import (
+                modelscope_chat_completion,
+                modelscope_is_configured,
+            )
+
+            if not modelscope_is_configured():
+                return fallback
+
+            nodes_summary = [
+                {
+                    "id": node.id,
+                    "type": node.type,
+                    "title": node.title,
+                    "command": node.command,
+                    "risk_level": node.risk_level,
+                }
+                for node in (plan.nodes or [])
+            ]
+            edges_summary = [
+                {
+                    "source_id": edge.source_id,
+                    "target_id": edge.target_id,
+                    "condition": edge.condition,
+                }
+                for edge in (plan.edges or [])
+            ]
+            prompt = (
+                "Audit this execution plan before it runs.\n"
+                f"Intent: {plan.intent}\n"
+                f"Nodes: {json.dumps(nodes_summary, ensure_ascii=False)}\n"
+                f"Edges: {json.dumps(edges_summary, ensure_ascii=False)}\n"
+                "Evaluate step ordering, rollback coverage for warn/block nodes, "
+                "whether risky commands have diagnose or verify steps ahead of them, "
+                "and whether the plan matches the intent.\n"
+                "Return JSON only as:\n"
+                '{"severity":"pass|warn|fail","summary":"...",'
+                '"findings":[{"severity":"pass|warn|fail|info","title":"...","message":"..."}],'
+                '"recommendations":["..."]}'
+            )
+
+            def _call() -> str:
+                return modelscope_chat_completion(
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "You audit execution plans for safety and correctness. "
+                                "Return strict JSON only."
+                            ),
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.1,
+                    max_tokens=600,
+                )
+
+            pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            future = pool.submit(_call)
+            try:
+                raw = future.result(timeout=timeout)
+            finally:
+                pool.shutdown(wait=False, cancel_futures=True)
+
+            match = _re.search(r"\{[\s\S]*\}", raw or "")
+            if not match:
+                return fallback
+            result = json.loads(match.group(0))
+            if not isinstance(result, dict):
+                return fallback
+
+            findings = result.get("findings")
+            if not isinstance(findings, list) or not findings:
+                findings = [
+                    {
+                        "severity": "info",
+                        "title": "Pre-audit completed",
+                        "message": "No explicit findings were returned.",
+                    }
+                ]
+            result["findings"] = findings
+            result["summary"] = str(
+                result.get("summary") or findings[0].get("message") or "Pre-audit completed"
+            )
+            recommendations = result.get("recommendations")
+            if not isinstance(recommendations, list):
+                recommendations = []
+            result["recommendations"] = recommendations
+            severity = str(result.get("severity") or "pass").strip().lower()
+            result["severity"] = severity if severity in {"pass", "warn", "fail"} else "pass"
+            return result
+        except Exception:
+            return fallback
 
     def _audit_one(self, suggestion: dict) -> dict:
         """对单条建议进行安全审查"""
