@@ -1,4 +1,4 @@
-﻿/* global Terminal, FitAddon */
+/* global Terminal, FitAddon */
 
 const statusEl = document.getElementById('status');
 const stepsEl = document.getElementById('steps');
@@ -68,7 +68,7 @@ const runbookListEl = document.getElementById('runbookList');
 
 let currentExecutorMode = '';
 let ptySupported = false;
-let terminalMode = 'pty';
+let terminalMode = 'plan';
 let ptyWebSocket = null;
 let termDataDisposable = null;
 let termResizeDisposable = null;
@@ -1156,17 +1156,102 @@ function closePlanStream() {
   }
 }
 
+const SHELL_COMMAND_PREFIX_RE = /^(git|npm|pnpm|yarn|node|python|python3|pip|uv|cargo|go|java|docker|kubectl|ssh|scp|ls|dir|cd|pwd|cat|type|echo|grep|rg|find|ps|kill|tasklist|taskkill|netstat|ss|lsof|curl|wget|ping|tracert|ipconfig|ifconfig|systemctl|service|journalctl|make|cmake|pytest|uvicorn|bash|sh|pwsh|powershell|cmd)$/;
+const CHAT_PATTERNS = [
+  /^(你好|您好|嗨|哈喽|在吗)\s*[!.。！？?]*$/i,
+  /^(hi|hello|hey)\s*[!.。！？?]*$/i,
+  /^(谢谢|谢了|thanks|thank you)\s*[!.。！？?]*$/i,
+  /^(你是谁|你是做什么的|who are you)\s*[!.。！？?]*$/i,
+];
+const PLAN_PATTERNS = [
+  /(排查|修复|执行计划|计划|步骤|方案|runbook|checklist)/i,
+  /(帮我|给我|请你).*(排查|修复|处理|解决|配置|安装|梳理|生成)/i,
+  /(怎么|如何).*(修复|排查|处理|解决)/i,
+];
+
+function isLikelyCommand(text) {
+  const value = String(text || '').trim();
+  if (!value) return false;
+  if (/[\u4e00-\u9fff]/.test(value) && !/[|><=&]/.test(value)) return false;
+  const first = value.split(/\s+/)[0].toLowerCase();
+  if (SHELL_COMMAND_PREFIX_RE.test(first)) return true;
+  if (/[|><=&]/.test(value)) return true;
+  if (/^(\.\/|\.\.\/|~\/|\/)/.test(value)) return true;
+  return false;
+}
+
 function isLikelyNaturalLanguage(text) {
   const value = String(text || '').trim();
   if (!value) return false;
   if (/[\u4e00-\u9fff]/.test(value)) return true;
   const first = value.split(/\s+/)[0].toLowerCase();
-  if (/^(git|npm|pnpm|yarn|node|python|python3|pip|uv|cargo|go|java|docker|kubectl|ssh|scp|ls|dir|cd|pwd|cat|type|echo|grep|rg|find|ps|kill|tasklist|taskkill|netstat|ss|lsof|curl|wget|ping|tracert|ipconfig|ifconfig|systemctl|service|journalctl|make|cmake|pytest|uvicorn|bash|sh|pwsh|powershell|cmd)$/.test(first)) {
+  if (SHELL_COMMAND_PREFIX_RE.test(first)) {
     return false;
   }
   if (/\?$/.test(value)) return true;
   if (value.split(/\s+/).length >= 5 && !/[|><=&]/.test(value)) return true;
   return false;
+}
+
+function classifyInputIntent(text) {
+  const value = String(text || '').trim();
+  if (!value) return { kind: 'empty', confidence: 1, reason: 'empty_input', missing: [] };
+  if (isLikelyCommand(value)) return { kind: 'command', confidence: 0.95, reason: 'command_shape', missing: [] };
+  if (CHAT_PATTERNS.some((pattern) => pattern.test(value))) return { kind: 'chat', confidence: 0.95, reason: 'chat_pattern', missing: [] };
+  if (PLAN_PATTERNS.some((pattern) => pattern.test(value))) return { kind: 'plan', confidence: 0.85, reason: 'plan_pattern', missing: [] };
+  if (isLikelyNaturalLanguage(value)) return { kind: 'clarify', confidence: 0.7, reason: 'natural_language_needs_clarify', missing: ['goal'] };
+  return { kind: 'command', confidence: 0.6, reason: 'fallback_command', missing: [] };
+}
+
+function writeAssistantLines(lines, color = '\x1b[36m') {
+  const items = Array.isArray(lines) ? lines : [lines];
+  for (const line of items) {
+    if (!line) continue;
+    writePlanTerminalLine(`[AI] ${line}`, color);
+  }
+}
+
+function handleChatIntent(intent) {
+  const value = String(intent || '').trim();
+  clearSuggestions();
+  renderSteps([]);
+  const replies = /^(谢谢|谢了|thanks|thank you)/i.test(value)
+    ? ['收到。继续输入命令或问题即可。']
+    : /^(你是谁|你是做什么的|who are you)/i.test(value)
+      ? ['我是终端助手。你可以直接输入命令，或描述你要排查的问题。']
+      : ['你好。直接输入命令，或描述你要处理的问题。'];
+  writeAssistantLines(replies);
+  setStatusReady();
+}
+
+function buildClarifyReply(intent) {
+  const value = String(intent || '').trim();
+  if (/docker/i.test(value)) {
+    return [
+      '我理解你是在处理 Docker 相关问题。',
+      '你是想查启动失败原因、查看日志，还是直接给出排查步骤？',
+      '也可以直接说“帮我排查 docker 起不来并给步骤”。',
+    ];
+  }
+  if (/(8000|端口|port)/i.test(value)) {
+    return [
+      '我理解你是在处理端口问题。',
+      '你是想查谁占用了端口、为什么监听失败，还是想直接释放端口？',
+      '也可以直接说“帮我排查 8000 端口占用并给步骤”。',
+    ];
+  }
+  return [
+    `我理解你想处理：${value}`,
+    '现在还缺少一个关键目标：你希望我解释原因、给命令，还是直接生成排查步骤？',
+    '你也可以补一句更明确的话，例如“帮我排查并给步骤”。',
+  ];
+}
+
+function handleClarifyIntent(intent) {
+  clearSuggestions();
+  renderSteps([]);
+  writeAssistantLines(buildClarifyReply(intent));
+  setStatusReady();
 }
 
 async function streamSuggestionsForIntent(intent, extraPayload = {}) {
@@ -1276,7 +1361,7 @@ async function approveAllPlanNodes() {
   writePlanTerminalLine('[PLAN] 已记录全部批准，后续待审批节点会自动放行。', '\x1b[36m');
 }
 
-async function startIntentIteration(intent, { autoExecute = false } = {}) {
+async function startIntentIteration(intent, { autoExecute = false, generatePlan = true } = {}) {
   const normalized = String(intent || '').trim();
   if (!normalized) return;
   try {
@@ -1306,8 +1391,9 @@ async function startIntentIteration(intent, { autoExecute = false } = {}) {
         await dispatchTerminalCommand(s.command, false);
       }
     );
-    await generateExecutionPlan(normalized, sug.suggestions || []);
-    // Natural-language intents should stop at plan generation.
+    if (generatePlan) {
+      await generateExecutionPlan(normalized, sug.suggestions || []);
+    }
     // Actual execution must be a separate user action from the plan panel.
     void autoExecute;
     setStatusReady();
@@ -1805,7 +1891,7 @@ async function apiRunbooksDelete(filename) {
 }
 
 async function runSuggestOnly(text) {
-  await startIntentIteration(text, { autoExecute: false });
+  await startIntentIteration(text, { autoExecute: false, generatePlan: false });
   prompt();
 }
 
@@ -2116,6 +2202,7 @@ function renderSuggestions(suggestions, insertFn, executeFn) {
 
     const card = document.createElement('div');
     card.className = 'card';
+    card.dataset.suggestionId = String(s.id || '');
 
     const title = document.createElement('div');
     title.className = 'card-title';
@@ -3323,12 +3410,19 @@ async function handlePlanModeInput(data) {
       await runSuggestOnly(cmd.slice(1).trim());
       return;
     }
-    if (isLikelyNaturalLanguage(cmd)) {
+    const intent = classifyInputIntent(cmd);
+    if (intent.kind !== 'command') {
       pushHistory(cmd);
       term.write('\r\n');
       currentLine = '';
       cursorPos = 0;
-      await startIntentIteration(cmd, { autoExecute: false });
+      if (intent.kind === 'chat') {
+        handleChatIntent(cmd);
+      } else if (intent.kind === 'clarify') {
+        handleClarifyIntent(cmd);
+      } else {
+        await startIntentIteration(cmd, { autoExecute: false, generatePlan: true });
+      }
       prompt();
       return;
     }
@@ -3423,11 +3517,11 @@ if (executorSwitchEl) {
     const m = st ? (st.mode || st.current_mode) : '';
     if (m) {
       currentExecutorMode = String(m);
-      await setTerminalMode(ptySupported ? 'pty' : 'plan');
+      await setTerminalMode('plan');
       return;
     }
     if (h && h.executor) currentExecutorMode = String(h.executor);
-    await setTerminalMode(ptySupported ? 'pty' : 'plan');
+    await setTerminalMode('plan');
   } catch {
     statusEl.textContent = '后端未连接';
   }
