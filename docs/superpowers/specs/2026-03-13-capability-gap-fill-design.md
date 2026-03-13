@@ -105,12 +105,20 @@ For the port-in-use scenario (detected by checking if any suggestion has id star
 
 ```
 n0 (diagnose: Analyze Intent)
-  └─[success]→ n1 (command: ss -ltnp | grep :8000)
-                  ├─[success]→ n2 (command: kill <PID>) → n3 (verify: ss check) → n4 (end)
-                  └─[failure]→ n4 (end: port already free)
+  └─[success]→ n1 (command: ss -ltnp | grep :8000, risk=safe)
+                  ├─[success]→ n2 (command: ps -fp <PID> — 查看占用进程详情, risk=safe)
+                  │               └─[success]→ n3 (human: 确认是否终止该进程?)
+                  │                               └─[success]→ n4 (command: kill <PID>, risk=warn)
+                  │                                               └─[success]→ n5 (verify: ss -ltnp | grep :8000)
+                  │                                                               └─[success]→ n6 (end)
+                  └─[failure]→ n6 (end: 端口空闲，无需处理)
 ```
 
-Rationale: `ss -ltnp | grep :8000` exits 0 when the port is occupied (grep found a match) and non-zero when the port is free. The BFS engine routes `success`/`failure` edges based on the preceding node's status, so this natively encodes the branch without a separate condition node.
+Rationale:
+- `ss -ltnp | grep :8000` exits 0 when the port is occupied (grep found a match), non-zero when the port is free. The BFS engine routes `success`/`failure` edges based on the preceding node's status, natively encoding the branch.
+- n2 (`ps -fp`) is read-only and lets the user see what process is running before deciding to kill.
+- n3 (`type="human"`) causes the BFS executor to pause and emit a `need_approval` SSE event. The user must explicitly approve before n4 executes. If the user skips n3, the kill is never run.
+- n4 (`risk=warn`) would also trigger `needs_approval` independently via the existing policy check, providing a second confirmation layer.
 
 **No `condition` node type is used** in hand-crafted plans. For LLM-generated plans (`generate_dag()`), the prompt instructs the LLM to place `success`/`failure` edges on command nodes rather than inserting intermediate condition nodes. Condition nodes that appear in LLM output are treated as no-ops (no command → the existing `_execute_node()` fallthrough already marks them `passed`); they function as visual-only labels in the DAG graph.
 
