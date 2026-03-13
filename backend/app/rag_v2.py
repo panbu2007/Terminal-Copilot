@@ -1,22 +1,21 @@
 """rag_v2.py — Hybrid vector + keyword RAG for Terminal Copilot.
 
 Strategy:
-- get_embedding()      : call ModelScope BAAI/bge-small-zh-v1.5 embeddings API
+- get_embedding()      : call configured embedding provider API
 - cosine_similarity()  : numpy cosine sim
 - vector_search()      : semantic retrieval over all docs
 - reciprocal_rank_fusion(): RRF merge of two ranked lists
 - hybrid_retrieve()    : combine vector search + keyword search via RRF;
-                         graceful degradation to keyword-only when no token/API error
+                         graceful degradation to keyword-only when embedding is unavailable
 """
 
 from __future__ import annotations
 
-import json
 import logging
-import urllib.error
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
+
+from .embedding_client import embed_text, resolve_embedding_config
 
 logger = logging.getLogger(__name__)
 
@@ -24,11 +23,8 @@ logger = logging.getLogger(__name__)
 # Module-level doc-vector cache
 # ---------------------------------------------------------------------------
 _DOC_VECTORS: dict[str, list[float]] = {}   # key = doc.source -> embedding vector
+_DOC_VECTOR_SIGNATURE = ""
 _CACHE_BUILDING = False                      # flag to avoid re-entrant build
-
-EMBEDDING_MODEL = "BAAI/bge-small-zh-v1.5"
-EMBEDDING_URL = "https://api-inference.modelscope.cn/v1/embeddings"
-EMBEDDING_TIMEOUT = 10  # seconds
 
 
 # ---------------------------------------------------------------------------
@@ -43,44 +39,11 @@ class VectorRAG:
 
     @staticmethod
     def get_embedding(text: str) -> Optional[list[float]]:
-        """Call ModelScope BAAI/bge-small-zh-v1.5 and return the embedding vector.
+        """Call the configured embedding provider and return the embedding vector.
 
         Returns None if no token is configured or any error occurs.
         """
-        from .llm.modelscope_client import _env_config
-
-        cfg = _env_config()
-        if cfg is None:
-            return None
-
-        payload = json.dumps(
-            {"model": EMBEDDING_MODEL, "input": [text]},
-            ensure_ascii=False,
-        ).encode("utf-8")
-
-        req = urllib.request.Request(
-            EMBEDDING_URL,
-            data=payload,
-            headers={
-                "Authorization": f"Bearer {cfg.access_token}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-
-        try:
-            with urllib.request.urlopen(req, timeout=EMBEDDING_TIMEOUT) as resp:
-                body = resp.read().decode("utf-8")
-        except Exception as exc:
-            logger.debug("get_embedding network error: %s", exc)
-            return None
-
-        try:
-            data = json.loads(body)
-            return data["data"][0]["embedding"]
-        except Exception as exc:
-            logger.debug("get_embedding parse error: %s; body=%s", exc, body[:200])
-            return None
+        return embed_text(text)
 
     # ------------------------------------------------------------------
     # Math helpers
@@ -180,14 +143,26 @@ class VectorRAG:
 # ---------------------------------------------------------------------------
 
 
-def _build_doc_vectors_sync() -> None:
+def _embedding_signature() -> str:
+    cfg = resolve_embedding_config(require_token=True)
+    if cfg is None:
+        return ""
+    return f"{cfg.provider}|{cfg.base_url}|{cfg.model}"
+
+
+def _build_doc_vectors_sync(expected_signature: str) -> None:
     """Compute and cache embeddings for all docs. Called in a background thread."""
     global _DOC_VECTORS, _CACHE_BUILDING
 
     from .rag import _load_docs
 
+    if not expected_signature:
+        _CACHE_BUILDING = False
+        return
+
     docs = _load_docs()
     if not docs:
+        _CACHE_BUILDING = False
         return
 
     def _embed_doc(doc) -> Tuple[str, Optional[list[float]]]:
@@ -201,6 +176,8 @@ def _build_doc_vectors_sync() -> None:
             futures = {pool.submit(_embed_doc, doc): doc for doc in docs}
             for future in as_completed(futures):
                 try:
+                    if expected_signature != _DOC_VECTOR_SIGNATURE:
+                        return
                     src, vec = future.result()
                     if vec is not None:
                         _DOC_VECTORS[src] = vec
@@ -214,7 +191,16 @@ def _build_doc_vectors_sync() -> None:
 
 def _ensure_doc_vectors() -> None:
     """Trigger async background build of doc vectors if not already done."""
-    global _CACHE_BUILDING
+    global _DOC_VECTORS, _DOC_VECTOR_SIGNATURE, _CACHE_BUILDING
+
+    signature = _embedding_signature()
+    if not signature:
+        return
+
+    if _DOC_VECTOR_SIGNATURE != signature:
+        _DOC_VECTORS = {}
+        _DOC_VECTOR_SIGNATURE = signature
+        _CACHE_BUILDING = False
 
     if _DOC_VECTORS or _CACHE_BUILDING:
         return
@@ -222,7 +208,7 @@ def _ensure_doc_vectors() -> None:
     _CACHE_BUILDING = True
     # Run in daemon thread so it doesn't block server startup
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rag_v2_build")
-    executor.submit(_build_doc_vectors_sync)
+    executor.submit(_build_doc_vectors_sync, signature)
     executor.shutdown(wait=False)
 
 
@@ -245,9 +231,7 @@ def hybrid_retrieve(query: str, limit: int = 3) -> list:
 
     # ---- Try hybrid path ----
     try:
-        from .llm.modelscope_client import _env_config
-
-        if _env_config() is not None and _DOC_VECTORS:
+        if _embedding_signature() and _DOC_VECTORS:
             docs = _load_docs()
 
             # Vector retrieval top-8
@@ -280,6 +264,7 @@ def hybrid_retrieve(query: str, limit: int = 3) -> list:
 
 
 def refresh_vector_cache() -> None:
-    global _DOC_VECTORS, _CACHE_BUILDING
+    global _DOC_VECTORS, _DOC_VECTOR_SIGNATURE, _CACHE_BUILDING
     _DOC_VECTORS = {}
+    _DOC_VECTOR_SIGNATURE = ""
     _CACHE_BUILDING = False

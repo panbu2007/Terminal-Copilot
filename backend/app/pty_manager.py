@@ -6,6 +6,12 @@ import signal
 import threading
 import time
 from dataclasses import dataclass, field
+from typing import Any
+
+try:
+    import pwd
+except ImportError:  # pragma: no cover - Windows dev fallback
+    pwd = None
 
 from .command_detector import CommandDetector
 from .conversation import ConversationHistory
@@ -67,6 +73,41 @@ def pty_supported() -> bool:
     return os.name != "nt" and all(mod is not None for mod in (fcntl, pty, struct, termios))
 
 
+def _pty_shell() -> str:
+    return os.environ.get("TERMINAL_COPILOT_PTY_SHELL") or os.environ.get("SHELL") or "/bin/bash"
+
+
+def _pty_drop_user() -> str:
+    return (os.environ.get("TERMINAL_COPILOT_PTY_DROP_USER") or "").strip()
+
+
+def _resolve_target_user() -> Any | None:
+    drop_user = _pty_drop_user()
+    if not drop_user or os.name == "nt" or pwd is None or os.geteuid() != 0:
+        return None
+    try:
+        return pwd.getpwnam(drop_user)
+    except KeyError:
+        return None
+
+
+def _drop_privileges(target_user: Any) -> None:
+    os.initgroups(target_user.pw_name, target_user.pw_gid)
+    os.setgid(target_user.pw_gid)
+    os.setuid(target_user.pw_uid)
+
+
+def _build_shell_env(target_user: Any | None) -> dict[str, str]:
+    env = os.environ.copy()
+    env["TERM"] = env.get("TERM") or "xterm-256color"
+    env["LANG"] = env.get("LANG") or "en_US.UTF-8"
+    if target_user is not None:
+        env["HOME"] = target_user.pw_dir
+        env["USER"] = target_user.pw_name
+        env["LOGNAME"] = target_user.pw_name
+    return env
+
+
 def create_pty_session(session_id: str, cwd: str) -> PTYSession:
     if not pty_supported():
         raise RuntimeError("pty_not_supported")
@@ -85,10 +126,16 @@ def create_pty_session(session_id: str, cwd: str) -> PTYSession:
             if slave_fd > 2:
                 os.close(slave_fd)
 
-            shell = os.environ.get("SHELL") or "/bin/bash"
-            env = os.environ.copy()
-            env["TERM"] = env.get("TERM") or "xterm-256color"
-            env["LANG"] = env.get("LANG") or "en_US.UTF-8"
+            target_user = _resolve_target_user()
+            shell = _pty_shell()
+            env = _build_shell_env(target_user)
+
+            if target_user is not None:
+                try:
+                    os.chdir(target_user.pw_dir)
+                except Exception:
+                    pass
+                _drop_privileges(target_user)
 
             try:
                 os.chdir(cwd)
