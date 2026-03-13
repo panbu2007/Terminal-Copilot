@@ -918,6 +918,67 @@ function appendNodeStdout(nodeId, chunk) {
   };
 }
 
+function renderPreAuditCard(preAudit) {
+  const existing = document.getElementById('planPreAuditCard');
+  if (existing) existing.remove();
+  if (!preAudit || !Array.isArray(preAudit.findings) || !preAudit.findings.length) return;
+
+  const card = document.createElement('div');
+  card.id = 'planPreAuditCard';
+  card.style.marginTop = '8px';
+
+  const severity = String(preAudit.severity || 'pass').toLowerCase();
+  const severityClass = severity === 'fail' ? 'fail' : severity === 'warn' ? 'warn' : 'info';
+
+  const header = document.createElement('div');
+  header.className = 'audit-finding severity-' + severityClass;
+  const headerTitle = document.createElement('div');
+  headerTitle.className = 'audit-finding-header';
+  headerTitle.textContent = '执行前预审 · ' + severity.toUpperCase();
+  header.appendChild(headerTitle);
+  const headerMsg = document.createElement('div');
+  headerMsg.className = 'audit-finding-msg';
+  headerMsg.textContent = String(preAudit.summary || '');
+  header.appendChild(headerMsg);
+  card.appendChild(header);
+
+  let showFindings = false;
+  const toggle = document.createElement('div');
+  toggle.className = 'explain';
+  toggle.style.cursor = 'pointer';
+  toggle.style.marginTop = '4px';
+  const findingsContainer = document.createElement('div');
+  findingsContainer.style.display = 'none';
+
+  const updateToggle = () => {
+    toggle.textContent = (showFindings ? '▼ ' : '▶ ') + '查看 ' + preAudit.findings.length + ' 条详情';
+    findingsContainer.style.display = showFindings ? '' : 'none';
+  };
+  updateToggle();
+  toggle.onclick = () => { showFindings = !showFindings; updateToggle(); };
+  card.appendChild(toggle);
+  card.appendChild(findingsContainer);
+
+  for (const f of preAudit.findings) {
+    const fc = String(f.severity || 'info').toLowerCase();
+    const row = document.createElement('div');
+    row.className = 'audit-finding severity-' + (fc === 'fail' ? 'fail' : fc === 'warn' ? 'warn' : 'info');
+    const rowTitle = document.createElement('div');
+    rowTitle.className = 'audit-finding-header';
+    rowTitle.textContent = String(f.title || '');
+    row.appendChild(rowTitle);
+    const rowMsg = document.createElement('div');
+    rowMsg.className = 'audit-finding-msg';
+    rowMsg.textContent = String(f.message || '');
+    row.appendChild(rowMsg);
+    findingsContainer.appendChild(row);
+  }
+
+  if (planGraphEl && planGraphEl.parentNode) {
+    planGraphEl.parentNode.insertBefore(card, planGraphEl.nextSibling);
+  }
+}
+
 function renderAuditReport(report) {
   currentAuditReport = report || null;
   if (!auditContentEl) return;
@@ -1149,6 +1210,7 @@ function renderPlan(plan, intent) {
   planRenderer.render(plan, {
     onNodeClick: (node, target) => openNodePopover(node, target),
   });
+  renderPreAuditCard((plan && plan.pre_audit) ? plan.pre_audit : null);
   setPlanUnread(true);
 }
 
@@ -1353,6 +1415,8 @@ async function generateExecutionPlan(intent, suggestions) {
   if (result && result.session_id) setSessionId(result.session_id);
   renderPlan(result.plan, intent);
   renderAuditReport(null);
+  const _oldPreAuditCard = document.getElementById('planPreAuditCard');
+  if (_oldPreAuditCard) _oldPreAuditCard.remove();
   switchSidePanel('plan');
   return result.plan;
 }

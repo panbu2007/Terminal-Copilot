@@ -818,58 +818,6 @@ async def api_suggest_stream(req: SuggestRequest) -> StreamingResponse:
                 }
             )
             return
-
-            # 鍏堝皾璇曡鍒欏紩鎿?
-            rule_suggestions = suggest(req)
-            # 濡傛灉瑙勫垯寮曟搸宸叉湁缁撴灉锛堥潪 orchestrator 鏉ユ簮锛夛紝鐩存帴鎺ㄩ€?
-            if rule_suggestions and not any(
-                "orchestrator" in (s.tags or []) for s in rule_suggestions
-            ):
-                q.put({"type": "rule_suggestions"})
-                # 浠嶇劧鎺ㄩ€?agent 鍗忎綔缁撴灉鐢ㄤ簬鍙鍖?
-
-            # 璋冪敤 OrchestratorAgent锛堝甫浜嬩欢闃熷垪锛?
-            from .agents import OrchestratorAgent
-            from .llm.modelscope_client import modelscope_is_configured
-
-            if modelscope_is_configured():
-                orchestrator = OrchestratorAgent()
-                agent_suggestions = orchestrator.process(
-                    user_intent=req.last_command,
-                    platform=req.platform,
-                    last_stdout=req.last_stdout,
-                    last_stderr=req.last_stderr,
-                    last_exit_code=req.last_exit_code,
-                    event_queue=q,
-                    conversation_messages=req.conversation_messages,
-                )
-                final = agent_suggestions if agent_suggestions else rule_suggestions
-            else:
-                # 鏃?LLM token锛屽彧鍙戜竴鏉?orchestrator 鐘舵€佺劧鍚庣敤瑙勫垯缁撴灉
-                q.put(
-                    {
-                        "type": "agent_progress",
-                        "agent": "orchestrator",
-                        "status": "done",
-                        "message": "规则引擎模式（未配置 LLM Token）",
-                    }
-                )
-                final = rule_suggestions
-
-            session = STORE.get_or_create(req.session_id)
-            from .grounding import annotate_confidence
-
-            annotate_confidence(final)
-            suggestions_data = [s.model_dump() for s in final]
-            steps_data = STORE.to_dict_steps(session)
-            q.put(
-                {
-                    "type": "suggestions",
-                    "session_id": str(session.id),
-                    "suggestions": suggestions_data,
-                    "steps": steps_data,
-                }
-            )
         except Exception as e:
             q.put({"type": "error", "message": str(e)[:200]})
         finally:
