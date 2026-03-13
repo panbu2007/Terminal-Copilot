@@ -16,3 +16,19 @@ frontend/dist/
 
 # local secrets
 .secrets/
+
+# git worktrees
+.worktrees/
+.superpowers/
+
+# local editor / agent config
+.claude/
+.vscode/
+AGENTS.md
+CLAUDE.md
+claude.md
+
+# docs: only keep runbooks in git
+docs/*
+!docs/runbook/
+!docs/runbook/**
