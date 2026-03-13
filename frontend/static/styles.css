@@ -17,7 +17,6 @@
 html,
 body {
   height: 100%;
-  overflow: hidden;
 }
 
 body {
@@ -26,6 +25,10 @@ body {
   color: var(--text);
   font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
   color-scheme: dark;
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 
 .topbar {
@@ -124,17 +127,21 @@ body {
 }
 
 .layout {
-  height: calc(100vh - 56px);
   display: grid;
   grid-template-columns: 1fr 360px;
+  flex: 1 1 auto;
+  min-height: 0;
   overflow: hidden;
 }
 
 .terminal-pane {
   position: relative;
+  display: flex;
+  flex-direction: column;
   padding: 12px;
   border-right: 1px solid var(--border);
   overflow: hidden;
+  min-height: 0;
 }
 
 .terminal-toolbar {
@@ -153,7 +160,8 @@ body {
 }
 
 .terminal {
-  height: calc(100% - 40px);
+  flex: 1 1 auto;
+  min-height: 0;
   border: 1px solid var(--border);
   border-radius: 10px;
   padding: 8px;
@@ -171,11 +179,11 @@ body {
 
 .side-pane {
   padding: 12px;
-  height: 100%;
   display: flex;
   flex-direction: column;
   overflow: hidden;
   overscroll-behavior: contain;
+  min-height: 0;
 }
 
 .side-tabs {
@@ -612,7 +620,8 @@ body {
 .node-popover {
   position: fixed;
   z-index: 200;
-  width: 300px;
+  width: min(300px, calc(100vw - 24px));
+  max-width: calc(100vw - 24px);
   background: rgba(17, 24, 49, 0.97);
   border: 1px solid rgba(139, 92, 246, 0.35);
   border-radius: 12px;
@@ -657,7 +666,7 @@ body {
   font-size: 12px;
   color: var(--muted);
   line-height: 1.6;
-  max-height: 320px;
+  max-height: min(320px, calc(100vh - 160px));
   overflow-y: auto;
 }
 
@@ -941,6 +950,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
+  padding: 16px;
 }
 
 .modal.hidden {
@@ -956,12 +966,14 @@ body {
 .modal-card {
   position: relative;
   width: min(560px, 92vw);
+  max-height: min(88vh, 960px);
   border: 1px solid var(--border);
   border-radius: 12px;
   padding: 14px;
   background: rgba(17, 24, 49, 0.96);
   backdrop-filter: blur(10px);
   box-shadow: 0 16px 50px rgba(0, 0, 0, 0.35);
+  overflow: auto;
 }
 
 .modal-wide {
@@ -1383,16 +1395,164 @@ button.danger {
 
 /* ── Mobile responsive layout ───────────────────────── */
 @media (max-width: 768px) {
+  body {
+    overflow: auto;
+  }
+
+  .topbar {
+    align-items: flex-start;
+    gap: 8px;
+    padding: 10px;
+    flex-wrap: wrap;
+    overflow: visible;
+  }
+
+  .topbar > * {
+    flex-shrink: 0;
+  }
+
+  .brand {
+    flex: 1 1 100%;
+  }
+
+  .segmented {
+    max-width: 100%;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .segmented::-webkit-scrollbar {
+    display: none;
+  }
+
+  .btn-export,
+  .segmented .seg-btn {
+    min-height: 38px;
+  }
+
+  .llm-guide {
+    order: 20;
+    flex: 1 1 100%;
+    max-width: none;
+    white-space: normal;
+    align-items: flex-start;
+    border-radius: 12px;
+    padding: 8px 10px;
+  }
+
+  #llmGuideText {
+    white-space: normal;
+  }
+
+  .status {
+    order: 21;
+    margin-left: 0;
+    flex: 1 1 100%;
+    max-width: none;
+    white-space: normal;
+  }
+
   .layout {
     grid-template-columns: 1fr;
-    grid-template-rows: 55vh 1fr;
+    grid-template-rows: minmax(280px, 48%) minmax(0, 1fr);
   }
+
   .terminal-pane {
     border-right: none;
     border-bottom: 1px solid var(--border);
+    padding: 10px;
+  }
+
+  .terminal-toolbar {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
+
+  .terminal-toolbar-hint {
+    white-space: normal;
+  }
+
+  .side-pane {
+    padding: 10px;
+  }
+
+  .side-tabs {
+    overflow-x: auto;
+    padding-bottom: 4px;
+    scrollbar-width: none;
+  }
+
+  .side-tabs::-webkit-scrollbar {
+    display: none;
+  }
+
+  .side-tab {
+    flex: 0 0 auto;
+    white-space: nowrap;
+  }
+
+  .plan-graph {
+    min-height: 220px;
+  }
+
+  .agent-step-label {
+    min-width: 76px;
+  }
+
+  .modal {
+    align-items: flex-start;
+    padding: 10px;
+  }
+
+  .modal-card,
+  .modal-wide {
+    width: 100%;
+    margin-top: 12px;
+    padding: 12px;
+  }
+
+  .modal-actions {
+    flex-wrap: wrap;
+  }
+
+  .modal-actions > * {
+    flex: 1 1 140px;
+  }
+
+  .runbook-item-head {
+    flex-direction: column;
   }
 
   .runbook-toolbar {
     grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 560px) {
+  .onboarding-card {
+    margin: 8px 10px 0;
+    padding: 14px 14px 16px;
+  }
+
+  .onboarding-header {
+    align-items: flex-start;
+    gap: 10px;
+  }
+
+  .onboarding-icon {
+    font-size: 22px;
+  }
+
+  .onboarding-title {
+    font-size: 14px;
+  }
+
+  .quick-demos {
+    grid-template-columns: 1fr;
+  }
+
+  .demo-label {
+    white-space: normal;
   }
 }
