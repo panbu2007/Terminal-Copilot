@@ -117,6 +117,9 @@ When making changes, prefer the smallest verification that proves the modified p
 
 - Prefer surgical changes over broad cleanup.
 - Preserve the current architecture unless the task explicitly asks for structural refactoring.
+- When writing or rewriting files that contain Chinese or other non-ASCII text, do not rely on default PowerShell redirection, `Set-Content`, or console encoding. In this repository that has already produced `?` replacement characters / mojibake in markdown files.
+- For non-ASCII file writes, use an explicit UTF-8-safe path such as Python `Path(...).write_text(..., encoding="utf-8")` or another tool that guarantees UTF-8 output. Verify by reading the file back as UTF-8, not by trusting the current PowerShell console rendering.
+- If PowerShell output looks garbled but UTF-8 readback is correct, treat that as a console-display problem; do not rewrite the file again through a lossy path.
 - Keep platform behavior correct. Suggestions should match the backend runtime environment, not the browser OS.
 - Be careful with in-memory state assumptions:
   - sessions are not durable across restart
