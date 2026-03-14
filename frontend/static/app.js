@@ -610,7 +610,7 @@ class PlanGraphRenderer {
     this.viewport = viewport;
     this.content = content;
     this.zoom = d3.zoom()
-      .scaleExtent([0.35, 2.5])
+      .scaleExtent([0.1, 5])
       .on('zoom', (event) => {
         this.currentTransform = event.transform;
         this.viewport.attr('transform', event.transform);
@@ -736,7 +736,16 @@ class PlanGraphRenderer {
 
   truncate(text, max) {
     const value = String(text || '');
-    return value.length > max ? `${value.slice(0, max - 1)}…` : value;
+    let width = 0;
+    let result = '';
+    for (const char of value) {
+      // CJK and full-width characters count as 2 units
+      const w = /[\u1100-\u115f\u2e80-\u9fff\uac00-\ud7a3\uf900-\ufaff\ufe10-\ufe19\ufe30-\ufe6f\uff01-\uff60\uffe0-\uffe6]/.test(char) ? 2 : 1;
+      if (width + w > max) { result += '…'; break; }
+      result += char;
+      width += w;
+    }
+    return result;
   }
 
   fit() {
@@ -748,7 +757,7 @@ class PlanGraphRenderer {
     const width = Math.max(this.container.clientWidth || 320, 320);
     const height = Math.max(this.container.clientHeight || 320, 320);
     if (width <= 0 || height <= 0) return;
-    const scale = Math.min(width / (bounds.width + 48), height / (bounds.height + 48), 1);
+    const scale = Math.min(width / (bounds.width + 48), height / (bounds.height + 48));
     const offsetX = (width - bounds.width * scale) / 2 - bounds.x * scale;
     const offsetY = (height - bounds.height * scale) / 2 - bounds.y * scale;
     this.scale = scale;
