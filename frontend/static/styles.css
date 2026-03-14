@@ -1454,13 +1454,17 @@ button.danger {
 
   .layout {
     grid-template-columns: 1fr;
-    grid-template-rows: minmax(280px, 48%) minmax(0, 1fr);
+    grid-template-rows: auto auto;
+    flex: 0 0 auto;
+    overflow: visible;
   }
 
   .terminal-pane {
     border-right: none;
     border-bottom: 1px solid var(--border);
     padding: 10px;
+    overflow: visible;
+    min-height: auto;
   }
 
   .terminal-toolbar {
@@ -1475,6 +1479,20 @@ button.danger {
 
   .side-pane {
     padding: 10px;
+    overflow: visible;
+    min-height: auto;
+    overscroll-behavior: auto;
+  }
+
+  .side-panel.active {
+    flex: 0 0 auto;
+  }
+
+  .steps,
+  .suggestions,
+  .audit-content {
+    overflow: visible;
+    flex: 0 0 auto;
   }
 
   .side-tabs {
