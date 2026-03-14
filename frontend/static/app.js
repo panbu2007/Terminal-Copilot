@@ -1136,7 +1136,10 @@ function renderAuditReport(report) {
     return;
   }
   const overall = String(report.overall || 'PASS').toUpperCase();
-  const verdictClass = overall === 'FAIL' ? 'fail' : report.failed > 0 || report.skipped > 0 ? 'warn' : 'pass';
+  const actionableSkipped = Number(report.actionable_skipped || 0);
+  const branchSkipped = Number(report.branch_skipped || 0);
+  const effectiveTotal = Number(report.effective_total || report.total || 0);
+  const verdictClass = overall === 'FAIL' ? 'fail' : report.failed > 0 || actionableSkipped > 0 ? 'warn' : 'pass';
   const verdictIcon = verdictClass === 'fail' ? '✕' : verdictClass === 'warn' ? '!' : '✓';
   auditContentEl.innerHTML = '';
   const verdict = document.createElement('div');
@@ -1144,7 +1147,7 @@ function renderAuditReport(report) {
   verdict.innerHTML = `
     <div class="audit-verdict-icon">${verdictIcon}</div>
     <div class="audit-verdict-label">${escapeHtml(overall)}</div>
-    <div class="audit-verdict-stats">${report.passed || 0}/${report.total || 0} 通过 · ${report.failed || 0} 失败 · ${report.skipped || 0} 跳过</div>
+    <div class="audit-verdict-stats">${report.passed || 0}/${effectiveTotal || 0} 通过 · ${report.failed || 0} 失败 · ${actionableSkipped} 跳过${branchSkipped ? ` · ${branchSkipped} 未命中分支` : ''}</div>
   `;
   auditContentEl.appendChild(verdict);
 
@@ -1199,9 +1202,14 @@ function renderAuditReport(report) {
     row.className = 'audit-finding severity-info';
     const output = node.output || {};
     const excerpt = String(output.stderr || output.stdout || '').trim().slice(0, 180);
+    const skipReason = node.skip_reason === 'unreachable'
+      ? ' · 分支未命中'
+      : node.skip_reason
+        ? ` · 跳过原因: ${escapeHtml(String(node.skip_reason))}`
+        : '';
     row.innerHTML = `
       <div class="audit-finding-header">${escapeHtml(node.title || node.node_id)} · ${escapeHtml(node.status || '')}</div>
-      <div class="audit-finding-msg">类型: ${escapeHtml(node.type || 'command')} · 风险: ${escapeHtml(node.risk_level || 'safe')} · 依据: ${node.grounded ? 'grounded' : 'unverified'}${excerpt ? ` · 输出: ${escapeHtml(excerpt)}` : ''}</div>
+      <div class="audit-finding-msg">类型: ${escapeHtml(node.type || 'command')} · 风险: ${escapeHtml(node.risk_level || 'safe')} · 依据: ${node.grounded ? 'grounded' : 'unverified'}${skipReason}${excerpt ? ` · 输出: ${escapeHtml(excerpt)}` : ''}</div>
     `;
     auditContentEl.appendChild(row);
   }
@@ -1222,11 +1230,14 @@ function renderAuditReport(report) {
       `- Plan ID: ${report.plan_id || ''}`,
       `- Intent: ${report.intent || ''}`,
       `- Overall: ${overall}`,
-      `- Passed: ${report.passed || 0}/${report.total || 0}`,
+      `- Passed: ${report.passed || 0}/${effectiveTotal || 0}`,
+      `- Failed: ${report.failed || 0}`,
+      `- Skipped: ${actionableSkipped}`,
+      ...(branchSkipped ? [`- Branch Not Taken: ${branchSkipped}`] : []),
       ``,
       ...(analysis ? [`## Analysis`, ``, `- Severity: ${analysis.severity || ''}`, `- Summary: ${analysis.summary || ''}`, ``] : []),
       `## Nodes`,
-      ...((report.nodes || []).map((node) => `- ${node.title || node.node_id}: ${node.status} (${node.risk_level})`)),
+      ...((report.nodes || []).map((node) => `- ${node.title || node.node_id}: ${node.status}${node.skip_reason ? ` [${node.skip_reason}]` : ''} (${node.risk_level})`)),
     ];
     downloadText(`audit-${report.plan_id || 'report'}.md`, lines.join('\n'));
   };

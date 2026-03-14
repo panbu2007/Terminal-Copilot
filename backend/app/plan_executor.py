@@ -227,6 +227,7 @@ def _execute_plan(state: PlanExecutionState) -> None:  # noqa: C901
             continue
         if state.node_statuses.get(nid) in {"pending", "awaiting_approval"}:
             state.node_statuses[nid] = "skipped"
+            state.node_outputs.setdefault(nid, {})["skip_reason"] = "unreachable"
             _emit(state, {"type": "node_skipped", "node_id": nid, "reason": "unreachable"})
 
     # Build audit report
@@ -234,6 +235,14 @@ def _execute_plan(state: PlanExecutionState) -> None:  # noqa: C901
     passed = sum(1 for s in state.node_statuses.values() if s == "passed")
     failed = sum(1 for s in state.node_statuses.values() if s == "failed")
     skipped = sum(1 for s in state.node_statuses.values() if s == "skipped")
+    branch_skipped = sum(
+        1
+        for nid, status in state.node_statuses.items()
+        if status == "skipped"
+        and state.node_outputs.get(nid, {}).get("skip_reason") == "unreachable"
+    )
+    actionable_skipped = skipped - branch_skipped
+    effective_total = total - branch_skipped
 
     has_fail = failed > 0
     overall = "FAIL" if has_fail else "PASS"
@@ -241,6 +250,7 @@ def _execute_plan(state: PlanExecutionState) -> None:  # noqa: C901
     node_report = []
     for nid, ns in state.node_statuses.items():
         n = nodes.get(nid)
+        output = state.node_outputs.get(nid, {})
         node_report.append({
             "node_id": nid,
             "title": n.title if n else nid,
@@ -248,7 +258,8 @@ def _execute_plan(state: PlanExecutionState) -> None:  # noqa: C901
             "risk_level": n.risk_level if n else "safe",
             "grounded": bool(n.grounded) if n else False,
             "type": n.type if n else "command",
-            "output": state.node_outputs.get(nid, {}),
+            "output": output,
+            "skip_reason": output.get("skip_reason", ""),
         })
 
     report = {
@@ -256,9 +267,12 @@ def _execute_plan(state: PlanExecutionState) -> None:  # noqa: C901
         "intent": plan.intent,
         "overall": overall,
         "total": total,
+        "effective_total": effective_total,
         "passed": passed,
         "failed": failed,
         "skipped": skipped,
+        "actionable_skipped": actionable_skipped,
+        "branch_skipped": branch_skipped,
         "nodes": node_report,
     }
     report["analysis"] = _AUDITOR.summarize_execution_audit(report)
@@ -309,16 +323,19 @@ def _execute_node(state: PlanExecutionState, node: PlanNode) -> str:
             return "skipped"
 
         if nid in state.skipped_by_user:
+            state.node_outputs[nid] = {"skip_reason": "skipped_by_user"}
             _emit(state, {"type": "node_skipped", "node_id": nid, "reason": "skipped_by_user"})
             return "skipped"
 
         if not approved:
+            state.node_outputs[nid] = {"skip_reason": "approval_timeout"}
             # Timed out or cancelled — skip the node
             _emit(state, {"type": "node_skipped", "node_id": nid, "reason": "approval_timeout"})
             return "skipped"
 
         # If risk==block, even after approval we don't run the command
         if node.risk_level == "block":
+            state.node_outputs[nid] = {"skip_reason": "blocked_by_policy"}
             _emit(state, {"type": "node_skipped", "node_id": nid, "reason": "blocked_by_policy"})
             return "skipped"
 

@@ -13,6 +13,7 @@ frontend/dist/
 
 # logs
 *.log
+.local-run/
 
 # local secrets
 .secrets/
