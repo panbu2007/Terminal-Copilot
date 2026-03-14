@@ -2723,6 +2723,7 @@ let fitAddon = null;
 try {
   if (typeof FitAddon !== 'undefined' && FitAddon && FitAddon.FitAddon) {
     fitAddon = new FitAddon.FitAddon();
+    window.fitAddon = fitAddon;
     term.loadAddon(fitAddon);
     fitAddon.fit();
   }

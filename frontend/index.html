@@ -31,6 +31,7 @@
       </div>
       <button id="export" class="btn-export">导出回放</button>
       <div class="status" id="status">连接中...</div>
+      <button class="mobile-menu-btn" id="mobileMenuBtn" aria-label="打开菜单" type="button">≡</button>
     </header>
 
     <!-- 游客快速体验引导 -->
@@ -195,5 +196,66 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/dagre/0.8.5/dagre.min.js"></script>
     <script src="/static/app.js"></script>
+
+    <!-- Mobile Hamburger Drawer -->
+    <div id="mobileDrawerOverlay" class="mobile-drawer-overlay"></div>
+    <div id="mobileDrawer" class="mobile-drawer" role="dialog" aria-modal="true" aria-label="设置菜单">
+      <div class="mobile-drawer-header">
+        <span class="mobile-drawer-title">设置</span>
+        <button class="mobile-drawer-close" id="mobileDrawerClose" type="button" aria-label="关闭">×</button>
+      </div>
+      <div class="mobile-drawer-section">
+        <div class="mobile-drawer-label">AI 模式</div>
+        <div class="mobile-drawer-segmented" id="mobileModeSeg">
+          <button class="mobile-drawer-seg-btn" data-mode="suggest" type="button">只建议</button>
+          <button class="mobile-drawer-seg-btn" data-mode="assist" type="button">建议+执行</button>
+        </div>
+      </div>
+      <div class="mobile-drawer-section">
+        <div class="mobile-drawer-label">终端模式</div>
+        <div class="mobile-drawer-segmented" id="mobileTermModeSeg">
+          <button class="mobile-drawer-seg-btn" data-term-mode="pty" type="button">🖥️ 真实</button>
+          <button class="mobile-drawer-seg-btn" data-term-mode="plan" type="button">📋 计划</button>
+        </div>
+      </div>
+      <div class="mobile-drawer-section">
+        <div class="mobile-drawer-label">执行器</div>
+        <div class="mobile-drawer-segmented" id="mobileExecSeg">
+          <button class="mobile-drawer-seg-btn" data-exec="simulate" type="button">simulate</button>
+          <button class="mobile-drawer-seg-btn" data-exec="local" type="button">local</button>
+        </div>
+      </div>
+      <div class="mobile-drawer-section">
+        <div class="mobile-drawer-btns">
+          <button id="mobileResetBtn" type="button">新会话</button>
+          <button id="mobileRunbooksBtn" type="button">知识库</button>
+          <button id="mobileLlmBtn" type="button">LLM设置</button>
+          <button id="mobileExportBtn" type="button">导出回放</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Mobile Bottom Tab Bar -->
+    <nav class="mobile-tab-bar" id="mobileTabBar" aria-label="导航">
+      <button class="mobile-tab-btn is-active" data-tab="terminal" type="button" aria-label="终端">
+        <span class="tab-icon">🖥</span>
+        <span class="tab-label">终端</span>
+      </button>
+      <button class="mobile-tab-btn" data-tab="agents" type="button" aria-label="Agents">
+        <span class="tab-icon">🧠</span>
+        <span class="tab-label">Agents</span>
+      </button>
+      <button class="mobile-tab-btn" data-tab="plan" type="button" aria-label="计划">
+        <span class="tab-icon">🗺️</span>
+        <span class="tab-label">计划</span>
+        <span class="mob-tab-dot hidden" id="mobPlanDot"></span>
+      </button>
+      <button class="mobile-tab-btn" data-tab="audit" type="button" aria-label="审计">
+        <span class="tab-icon">🧾</span>
+        <span class="tab-label">审计</span>
+      </button>
+    </nav>
+
+    <script src="/static/mobile.js"></script>
   </body>
 </html>
