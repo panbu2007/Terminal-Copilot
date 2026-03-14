@@ -22,6 +22,7 @@ The execution plan (DAG) is a static snapshot generated before any commands run.
 ## Non-Goals
 
 - Re-planning on non-`condition` node failures (out of scope for this iteration).
+- Re-planning on appended condition nodes that also fail (single-level re-plan only; nested re-plan not supported).
 - Persisting plans across server restarts (in-memory only, unchanged).
 - Changing the risk classification logic in `policy.py`.
 
@@ -33,7 +34,7 @@ The execution plan (DAG) is a static snapshot generated before any commands run.
 
 **File:** `backend/app/agents/replan_agent.py`
 
-Follows the same pattern as existing agents (`DiagAgent`, `SafetyAgent`). Stateless, instantiated once as a module-level singleton in `plan_executor.py`.
+Follows the same pattern as existing agents (`DiagAgent`, `SafetyAgent`). Stateless, instantiated once as a module-level singleton in `plan_executor.py`. LLM call timeout: 10 seconds; exceeding it returns `([], [])`.
 
 ```python
 class ReplanAgent(BaseAgent):
@@ -51,8 +52,10 @@ class ReplanAgent(BaseAgent):
 
 - Calls LLM with plan intent + failed node title + stdout/stderr.
 - Returns new nodes and edges to append after the failed condition node.
-- On LLM unavailability or parse failure: returns `([], [])` — silent degradation, no crash.
-- Node IDs are generated with a `rx_` prefix and a uuid suffix to avoid collisions with existing node IDs.
+- On LLM unavailability, timeout, or parse failure: returns `([], [])` — silent degradation, no crash.
+- Node IDs use the scheme `rx_{failed_node_id}_{uuid4().hex[:8]}` to guarantee no collision across plans, nodes, and parallel calls.
+- Appended nodes are always `grounded=False`, `citations=[]` (LLM-generated, not runbook-backed).
+- Informational nodes (empty command) always pass immediately and are not subject to approval or auto-run rules.
 
 ### Changes to `PlanExecutionState`
 
@@ -60,8 +63,12 @@ class ReplanAgent(BaseAgent):
 @dataclass
 class PlanExecutionState:
     ...
-    auto_run_level: str = "none"  # "none" | "safe" | "safe_warn"
+    auto_run_level: str = "none"   # "none" | "safe" | "safe_warn"
+    appended_nodes: list[PlanNode] = field(default_factory=list)   # for audit/SSE
+    appended_edges: list[PlanEdge] = field(default_factory=list)
 ```
+
+`appended_nodes` / `appended_edges` accumulate all dynamically injected nodes for the audit report and SSE serialisation.
 
 ### Changes to `plan_executor.py`
 
@@ -71,8 +78,10 @@ _REPLANNER = ReplanAgent()
 ```
 
 **BFS loop — re-plan trigger** (after `_execute_node` returns):
+
 ```python
 if node.type == "condition" and node_status == "failed":
+    _emit(state, {"type": "replan_starting", "failed_node_id": node_id})
     new_nodes, new_edges = _REPLANNER.generate_extension(
         plan_intent=plan.intent,
         failed_node=node,
@@ -92,9 +101,33 @@ if node.type == "condition" and node_status == "failed":
         _emit(state, {"type": "replan_failed", "reason": "LLM unavailable or no extension generated"})
 ```
 
-**`_inject_extension` helper:** adds nodes to `nodes` dict, initialises `node_statuses` to `"pending"`, creates `approve_events`, updates `out_edges` and `in_degree`.
+**`_inject_extension(state, nodes, out_edges, in_degree, source_node_id, new_nodes, new_edges)`**
+
+Mutates all passed-in local BFS structures **and** the state object:
+
+1. For each new node: add to `nodes` dict, set `state.node_statuses[n.id] = "pending"`, create `state.approve_events[n.id] = threading.Event()`.
+2. For each new edge: add to `out_edges[src]`, increment `in_degree[tgt]`.
+3. Append to `state.appended_nodes` and `state.appended_edges` (for audit/SSE).
+4. Append to `state.plan.nodes` and `state.plan.edges` so the state object stays consistent with any external reader.
+
+Note: `state.plan` is an in-memory Pydantic model; `.nodes` and `.edges` are regular Python lists and are mutable at runtime.
+
+Edge wiring pattern:
+
+```
+Before:  condition_N --success--> end
+         (condition_N --failure--> nothing, BFS stops here)
+
+After _inject_extension adds new_nodes [rx_1, rx_2] and edges
+[condition_N→rx_1 (always), rx_1→rx_2 (success), rx_2→end (success)]:
+  condition_N --failure--> (replan trigger)
+                           --> rx_1 --> rx_2 --> end
+```
+
+The new root node (`rx_1`, `in_degree == 0` after injection) is added to BFS queue.
 
 **Auto-run gate** in `_execute_node`:
+
 ```python
 auto_approve = (
     (state.auto_run_level == "safe" and node.risk_level == "safe") or
@@ -107,7 +140,7 @@ needs_approval = not auto_approve and (
 )
 ```
 
-`block` and `human` nodes are never auto-approved regardless of level.
+`block` and `human` nodes are never auto-approved regardless of level. Changing `auto_run_level` mid-execution takes effect only for nodes not yet in `awaiting_approval` state; nodes already waiting continue to wait for manual approval.
 
 ---
 
@@ -126,17 +159,20 @@ Request body extended (backward-compatible, defaults to `"none"`):
 ### `POST /api/plan/{id}/auto-run` *(new)*
 
 Adjust auto-run level for a running plan:
-```json
-{ "level": "none" | "safe" | "safe_warn" }
-```
 
-Returns `{"ok": true}` or `404` if plan not found.
+```
+Request:  { "level": "none" | "safe" | "safe_warn" }
+200:      { "ok": true, "new_level": "safe_warn" }
+400:      { "ok": false, "error": "invalid level" }
+404:      { "ok": false, "error": "plan not found" }
+```
 
 ### New SSE Events
 
 | Event | Fields | Description |
 |-------|--------|-------------|
-| `nodes_appended` | `nodes[]`, `edges[]` | Re-plan succeeded; new nodes injected |
+| `replan_starting` | `failed_node_id` | Condition node failed; LLM re-plan in progress |
+| `nodes_appended` | `nodes[]`, `edges[]` | Re-plan succeeded; new nodes injected into DAG |
 | `replan_failed` | `reason` | LLM unavailable or returned no usable nodes |
 
 All existing events (`node_start`, `node_done`, `need_approval`, `node_skipped`, `audit_complete`, `plan_done`) are unchanged.
@@ -155,20 +191,23 @@ A segmented control in the plan panel header:
 
 - Available before and during execution.
 - Before execution: value sent with the `/execute` request.
-- During execution: calls `POST /api/plan/{id}/auto-run` immediately on change; takes effect on the next node.
+- During execution: calls `POST /api/plan/{id}/auto-run` immediately on change; takes effect on the next unstarted node.
 
 ### `PlanStreamClient` — new SSE branches
 
-- `nodes_appended`: calls `PlanGraphRenderer.appendNodes(nodes, edges)`.
-- `replan_failed`: shows an inline notice in the plan panel: "自动扩展不可用（LLM 未配置）".
+- `replan_starting`: show a spinner/notice on the failed condition node card: "正在生成后续步骤…".
+- `nodes_appended`: dismiss spinner; call `PlanGraphRenderer.appendNodes(nodes, edges)`.
+- `replan_failed`: show inline notice: "自动扩展不可用（LLM 未配置）".
 
 ### `PlanGraphRenderer.appendNodes(nodes, edges)`
 
-- Adds new nodes and edges to the existing dagre layout.
-- New nodes rendered with a distinct highlight style (e.g., dashed border) to distinguish them from the original plan.
-- Does not re-render already-completed nodes.
+- Adds new nodes and edges to the existing dagre graph object.
+- Calls `layout()` to recalculate positions for all nodes (existing nodes keep their relative order).
+- Calls `zoomToFit()` if appended nodes extend beyond the current viewport.
+- New nodes rendered with a distinct highlight style (dashed border) to distinguish them from original plan nodes.
+- Already-completed nodes retain their existing status styling.
 
-**Estimated additions:** ~100 lines in `app.js`.
+**Estimated additions:** ~110 lines in `app.js`.
 
 ---
 
@@ -176,15 +215,18 @@ A segmented control in the plan panel header:
 
 ```
 condition node fails
+    └─► emit replan_starting SSE → frontend shows spinner
     └─► plan_executor calls ReplanAgent.generate_extension()
             ├─► LLM available → returns new PlanNode[], PlanEdge[]
-            │       └─► _inject_extension() patches in-memory DAG
-            │       └─► emit nodes_appended SSE
+            │       └─► _inject_extension() mutates nodes, out_edges,
+            │               in_degree, state.appended_nodes,
+            │               state.plan.nodes/edges
+            │       └─► emit nodes_appended SSE → frontend updates DAG
             │       └─► BFS queue extended → new nodes execute
             │               └─► auto_run_level checked per node
             │                       ├─► safe/warn → skip approval wait
             │                       └─► block/human → still require approval
-            └─► LLM unavailable → returns ([], [])
+            └─► LLM unavailable / timeout → returns ([], [])
                     └─► emit replan_failed SSE → frontend shows notice
                     └─► BFS continues with original remaining nodes
 ```
@@ -197,9 +239,13 @@ condition node fails
 |----------|-----------|
 | LLM not configured | `replan_failed` emitted; plan completes normally |
 | ReplanAgent raises exception | Caught, treated as empty extension |
-| `block` node in appended nodes | Still requires approval (auto-run never overrides block) |
-| User cancels plan mid-replan | `cancel_event` checked at next BFS iteration; LLM call may complete but result is discarded |
-| New nodes have duplicate IDs | `rx_` prefix + uuid prevents collision |
+| ReplanAgent LLM call times out (10s) | Returns `([], [])`; `replan_failed` emitted |
+| `block` node in appended nodes | Still requires manual approval |
+| `human` node in appended nodes | Still requires manual approval |
+| User cancels plan mid-replan | `cancel_event` checked at next BFS iteration; LLM result discarded |
+| Appended condition node also fails | No further re-plan (single-level only); `replan_failed` not emitted, plan ends |
+| Condition node has no command | stdout/stderr are empty strings; ReplanAgent uses intent + node title only |
+| `auto_run_level` changed while node awaiting approval | No effect on current waiting node; applies to next node only |
 
 ---
 
@@ -209,7 +255,7 @@ condition node fails
 |------|--------|
 | `backend/app/agents/replan_agent.py` | **New** — `ReplanAgent` class |
 | `backend/app/agents/__init__.py` | Export `ReplanAgent` |
-| `backend/app/plan_executor.py` | Add `_REPLANNER`, `_inject_extension`, re-plan trigger, auto-run gate |
+| `backend/app/plan_executor.py` | Add `_REPLANNER`, `_inject_extension`, re-plan trigger in BFS, auto-run gate in `_execute_node` |
 | `backend/app/models.py` | No change (PlanNode/PlanEdge already sufficient) |
-| `backend/app/main.py` | Read `auto_run_level` from execute request; add `/auto-run` route |
-| `frontend/static/app.js` | Auto-run selector UI; `nodes_appended`/`replan_failed` SSE handlers; `appendNodes` method |
+| `backend/app/main.py` | Read `auto_run_level` from execute request; add `POST /api/plan/{id}/auto-run` route |
+| `frontend/static/app.js` | Auto-run selector UI; `replan_starting`/`nodes_appended`/`replan_failed` SSE handlers; `appendNodes` method |
