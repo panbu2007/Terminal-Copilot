@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -162,6 +163,31 @@ def _is_port_in_use_scenario(intent: str, suggestions: list[CommandSuggestion]) 
     return False
 
 
+def _is_port_replan_demo_scenario(intent: str) -> bool:
+    raw = intent or ""
+    low = raw.lower()
+    if not low:
+        return False
+    if "demo port replan" in low and "18080" in low:
+        return True
+    mentions_port = ("端口占用" in raw) or ("port occupancy" in low) or ("port in use" in low)
+    mentions_replan = False
+    for token in ("自动扩展", "续查", "replan", "demo", "演示"):
+        if token in low:
+            mentions_replan = True
+            break
+    mentions_demo_port = ("18080" in low) or ("demo 端口" in raw) or ("demo port" in low)
+    return bool(mentions_port and mentions_replan and mentions_demo_port)
+
+
+def _runtime_plan_platform() -> str:
+    if os.name == "nt":
+        return "windows"
+    if sys.platform == "darwin":
+        return "mac"
+    return "linux"
+
+
 def _port_plan_platform(suggestions: list[CommandSuggestion]) -> str:
     for suggestion in suggestions:
         suggestion_id = (suggestion.id or "").lower()
@@ -193,7 +219,12 @@ def _build_port_in_use_plan(*, intent: str, suggestions: list[CommandSuggestion]
             '\\"port 8000 not listening\\"; exit 1 }; '
             'Stop-Process -Id $p -Force; Write-Host (\\"stopped pid \\" + $p)"'
         )
-        verify_command = detect_command
+        verify_command = (
+            'powershell -NoProfile -Command "$conn = Get-NetTCPConnection -LocalPort 8000 '
+            '-State Listen -ErrorAction SilentlyContinue | Select-Object -First 1; '
+            'if ($conn) { Write-Host \\"port 8000 still occupied\\"; exit 1 }; '
+            'Write-Host \\"port 8000 is free\\"; exit 0"'
+        )
     elif platform == "mac":
         detect_command = "lsof -nP -iTCP:8000 -sTCP:LISTEN"
         inspect_command = (
@@ -205,7 +236,11 @@ def _build_port_in_use_plan(*, intent: str, suggestions: list[CommandSuggestion]
             "sh -lc 'pid=$(lsof -nP -t -iTCP:8000 -sTCP:LISTEN | head -n 1); "
             "[ -n \"$pid\" ] && kill \"$pid\" || { echo \"port 8000 not listening\"; exit 1; }'"
         )
-        verify_command = detect_command
+        verify_command = (
+            "sh -lc 'if lsof -nP -t -iTCP:8000 -sTCP:LISTEN | head -n 1 | grep . >/dev/null; "
+            "then echo \"port 8000 still occupied\"; exit 1; "
+            "fi; echo \"port 8000 is free\"; exit 0'"
+        )
     else:
         detect_command = "ss -ltnp | grep :8000"
         inspect_command = (
@@ -218,7 +253,11 @@ def _build_port_in_use_plan(*, intent: str, suggestions: list[CommandSuggestion]
             "\"s/.*:8000 .*pid=\\([0-9][0-9]*\\).*/\\1/p\" | head -n 1); "
             "[ -n \"$pid\" ] && kill \"$pid\" || { echo \"port 8000 not listening\"; exit 1; }'"
         )
-        verify_command = detect_command
+        verify_command = (
+            "sh -lc 'if ss -ltnp 2>/dev/null | grep -q :8000; "
+            "then echo \"port 8000 still occupied\"; exit 1; "
+            "fi; echo \"port 8000 is free\"; exit 0'"
+        )
 
     root_id = "n0"
     end_id = "n6"
@@ -276,12 +315,12 @@ def _build_port_in_use_plan(*, intent: str, suggestions: list[CommandSuggestion]
         ),
         PlanNode(
             id="n5",
-            type="verify",
-            title="Verify whether port 8000 is now free",
+            type="condition",
+            title="Check whether port 8000 is now free",
             command=verify_command,
             risk_level=RiskLevel.safe,
             grounded=bool(base_citations),
-            description="Re-check the port after the stop action.",
+            description="Only finish when the port is actually free; otherwise dynamic follow-up steps can be appended.",
             citations=list(base_citations),
         ),
         PlanNode(
@@ -301,8 +340,8 @@ def _build_port_in_use_plan(*, intent: str, suggestions: list[CommandSuggestion]
         PlanEdge(source_id="n1", target_id=end_id, condition="failure", label="free"),
         PlanEdge(source_id="n2", target_id="n3", condition="success", label="reviewed"),
         PlanEdge(source_id="n3", target_id="n4", condition="success", label="approved"),
-        PlanEdge(source_id="n4", target_id="n5", condition="success", label="verify"),
-        PlanEdge(source_id="n5", target_id=end_id, condition="success", label="done"),
+        PlanEdge(source_id="n4", target_id="n5", condition="success", label="check"),
+        PlanEdge(source_id="n5", target_id=end_id, condition="success", label="free"),
     ]
 
     return ExecutionPlan(
@@ -311,6 +350,176 @@ def _build_port_in_use_plan(*, intent: str, suggestions: list[CommandSuggestion]
         nodes=nodes,
         edges=edges,
         root_id=root_id,
+        generated_by="planner",
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+
+def _build_port_replan_demo_plan(*, intent: str) -> ExecutionPlan:
+    """Safe showcase plan for ReplanAgent on a harmless demo port."""
+    platform = _runtime_plan_platform()
+    demo_port = 18080
+
+    if platform == "windows":
+        start_command = (
+            'powershell -NoProfile -Command "$demoDir = Join-Path $env:TEMP \\"tc-demo-port-replan\\"; '
+            'New-Item -ItemType Directory -Force $demoDir | Out-Null; '
+            '$pidFile = Join-Path $demoDir \\"listener.pid\\"; '
+            'if (Test-Path $pidFile) { $pid = Get-Content $pidFile | Select-Object -First 1; '
+            'if ($pid -and (Get-Process -Id $pid -ErrorAction SilentlyContinue)) { '
+            'Write-Host (\\"demo listener already running pid=\\" + $pid + \\" port=18080\\"); exit 0 } }; '
+            '$script = \\"import http.server, socketserver, threading; PORT=18080; '
+            'Handler=http.server.SimpleHTTPRequestHandler; '
+            'httpd=socketserver.TCPServer((\'127.0.0.1\', PORT), Handler); '
+            'threading.Timer(120, httpd.shutdown).start(); httpd.serve_forever()\\"; '
+            '$p = Start-Process python -ArgumentList \'-c\', $script -WindowStyle Hidden -PassThru; '
+            'Set-Content -Path $pidFile -Value $p.Id; Start-Sleep -Seconds 1; '
+            'Write-Host (\\"demo listener started pid=\\" + $p.Id + \\" port=18080\\")"'
+        )
+        inspect_command = (
+            'powershell -NoProfile -Command "$conn = Get-NetTCPConnection -LocalPort 18080 '
+            '-State Listen -ErrorAction SilentlyContinue | Select-Object -First 1; '
+            'if (-not $conn) { Write-Host \\"demo listener not running\\"; exit 1 }; '
+            '$pid = $conn.OwningProcess; Get-Process -Id $pid | '
+            'Select-Object Id,ProcessName,Path | Format-Table -AutoSize"'
+        )
+        first_response_command = (
+            'powershell -NoProfile -Command "Write-Host \\"first response is observe-only for demo; keeping the listener alive\\"; exit 0"'
+        )
+        verify_command = (
+            'powershell -NoProfile -Command "$conn = Get-NetTCPConnection -LocalPort 18080 '
+            '-State Listen -ErrorAction SilentlyContinue | Select-Object -First 1; '
+            'if ($conn) { Write-Host \\"demo port 18080 still occupied\\"; exit 1 }; '
+            'Write-Host \\"demo port 18080 is free\\"; exit 0"'
+        )
+    elif platform == "mac":
+        start_command = (
+            "sh -lc 'demo_dir=\"${TMPDIR:-/tmp}/tc-demo-port-replan\"; mkdir -p \"$demo_dir\"; "
+            "pidfile=\"$demo_dir/listener.pid\"; "
+            "if [ -f \"$pidfile\" ] && kill -0 \"$(cat \"$pidfile\")\" 2>/dev/null; then "
+            "echo \"demo listener already running pid=$(cat \"$pidfile\") port=18080\"; exit 0; fi; "
+            "nohup python3 -c \"import http.server, socketserver, threading; PORT=18080; "
+            "Handler=http.server.SimpleHTTPRequestHandler; "
+            "httpd=socketserver.TCPServer(('127.0.0.1', PORT), Handler); "
+            "threading.Timer(120, httpd.shutdown).start(); httpd.serve_forever()\" "
+            ">\"$demo_dir/listener.log\" 2>&1 < /dev/null & echo $! >\"$pidfile\"; "
+            "sleep 1; echo \"demo listener ready pid=$(cat \"$pidfile\") port=18080\"'"
+        )
+        inspect_command = (
+            "sh -lc 'pid=$(lsof -nP -t -iTCP:18080 -sTCP:LISTEN | head -n 1); "
+            "[ -n \"$pid\" ] && ps -p \"$pid\" -o pid=,ppid=,user=,command= "
+            "|| { echo \"demo listener not running\"; exit 1; }'"
+        )
+        first_response_command = (
+            "sh -lc 'echo \"first response is observe-only for demo; keeping the listener alive\"; exit 0'"
+        )
+        verify_command = (
+            "sh -lc 'if lsof -nP -t -iTCP:18080 -sTCP:LISTEN | head -n 1 | grep . >/dev/null; "
+            "then echo \"demo port 18080 still occupied\"; exit 1; "
+            "fi; echo \"demo port 18080 is free\"; exit 0'"
+        )
+    else:
+        start_command = (
+            "sh -lc 'demo_dir=\"${TMPDIR:-/tmp}/tc-demo-port-replan\"; mkdir -p \"$demo_dir\"; "
+            "pidfile=\"$demo_dir/listener.pid\"; "
+            "if [ -f \"$pidfile\" ] && kill -0 \"$(cat \"$pidfile\")\" 2>/dev/null; then "
+            "echo \"demo listener already running pid=$(cat \"$pidfile\") port=18080\"; exit 0; fi; "
+            "nohup python3 -c \"import http.server, socketserver, threading; PORT=18080; "
+            "Handler=http.server.SimpleHTTPRequestHandler; "
+            "httpd=socketserver.TCPServer(('127.0.0.1', PORT), Handler); "
+            "threading.Timer(120, httpd.shutdown).start(); httpd.serve_forever()\" "
+            ">\"$demo_dir/listener.log\" 2>&1 < /dev/null & echo $! >\"$pidfile\"; "
+            "sleep 1; echo \"demo listener ready pid=$(cat \"$pidfile\") port=18080\"'"
+        )
+        inspect_command = (
+            "sh -lc 'pid=$(ss -ltnp 2>/dev/null | sed -n "
+            "\"s/.*:18080 .*pid=\\([0-9][0-9]*\\).*/\\1/p\" | head -n 1); "
+            "[ -n \"$pid\" ] && ps -fp \"$pid\" || { echo \"demo listener not running\"; exit 1; }'"
+        )
+        first_response_command = (
+            "sh -lc 'echo \"first response is observe-only for demo; keeping the listener alive\"; exit 0'"
+        )
+        verify_command = (
+            "sh -lc 'if ss -ltnp 2>/dev/null | grep -q :18080; "
+            "then echo \"demo port 18080 still occupied\"; exit 1; "
+            "fi; echo \"demo port 18080 is free\"; exit 0'"
+        )
+
+    nodes = [
+        PlanNode(
+            id="p0",
+            type="diagnose",
+            title="Prepare port-occupancy replan demo",
+            command="",
+            risk_level=RiskLevel.safe,
+            grounded=False,
+            description=intent or "Show dynamic re-planning on a harmless demo port.",
+            citations=[],
+        ),
+        PlanNode(
+            id="p1",
+            type="command",
+            title=f"Start demo listener on port {demo_port}",
+            command=start_command,
+            risk_level=RiskLevel.safe,
+            grounded=False,
+            description="Create or reuse a short-lived local listener dedicated to the demo.",
+            citations=[],
+        ),
+        PlanNode(
+            id="p2",
+            type="command",
+            title=f"Inspect the process holding port {demo_port}",
+            command=inspect_command,
+            risk_level=RiskLevel.safe,
+            grounded=False,
+            description="Show the demo listener process details before any remediation.",
+            citations=[],
+        ),
+        PlanNode(
+            id="p3",
+            type="command",
+            title="First response: observe only",
+            command=first_response_command,
+            risk_level=RiskLevel.safe,
+            grounded=False,
+            description="Intentionally avoid stopping the listener so the final condition fails and triggers re-plan.",
+            citations=[],
+        ),
+        PlanNode(
+            id="p4",
+            type="condition",
+            title=f"Is port {demo_port} free now?",
+            command=verify_command,
+            risk_level=RiskLevel.safe,
+            grounded=False,
+            description="This is expected to fail in the demo so ReplanAgent can append follow-up steps.",
+            citations=[],
+        ),
+        PlanNode(
+            id="p5",
+            type="end",
+            title="Demo complete",
+            command="",
+            risk_level=RiskLevel.safe,
+            grounded=True,
+            description="The demo path completed.",
+            citations=[],
+        ),
+    ]
+    edges = [
+        PlanEdge(source_id="p0", target_id="p1", condition="success", label="start"),
+        PlanEdge(source_id="p1", target_id="p2", condition="success", label="inspect"),
+        PlanEdge(source_id="p2", target_id="p3", condition="success", label="respond"),
+        PlanEdge(source_id="p3", target_id="p4", condition="success", label="re-check"),
+        PlanEdge(source_id="p4", target_id="p5", condition="success", label="free"),
+    ]
+    return ExecutionPlan(
+        id=str(uuid4()),
+        intent=intent or "",
+        nodes=nodes,
+        edges=edges,
+        root_id="p0",
         generated_by="planner",
         created_at=datetime.now(timezone.utc).isoformat(),
     )
@@ -635,6 +844,9 @@ def build_execution_plan(*, intent: str, suggestions: list[CommandSuggestion]) -
 
     # Scenario-specific plans (rich DAGs with branches)
     # Order matters: check more specific scenarios first to avoid cross-triggering.
+    if _is_port_replan_demo_scenario(intent):
+        return _build_port_replan_demo_plan(intent=intent)
+
     if _is_health_check_scenario(intent):
         return _build_health_check_plan(intent=intent)
 

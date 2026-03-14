@@ -282,7 +282,7 @@ function clearTimeline() {
 const DEMO_INTENTS = {
   health: '对这台服务器做一次全面健康巡检：检查磁盘空间、内存使用、CPU 负载、异常进程，有问题就修复，最后生成巡检报告。',
   deploy: '刚部署了一个服务，帮我验证它是否正常运行：检查进程是否存活、端口是否监听、健康接口是否响应、依赖是否完整。',
-  security: '对这台服务器做一次安全审查：扫描开放端口、检查可登录用户、查找异常进程、检查 SUID 文件权限，生成安全审计报告。',
+  port: 'demo port replan 18080: simulate occupancy on demo port 18080, do a first pass, and auto-extend follow-up steps if the port is still busy.',
 };
 
 function joinDemoPath(base, child) {
@@ -299,7 +299,7 @@ function quoteCdPath(target) {
 function getDemoTargetCwd(key) {
   if (!demoLocalRoot) return '';
   if (key === 'deploy' && demoWorkspaceAvailable) return joinDemoPath(demoLocalRoot, 'workspace');
-  if (key === 'health' || key === 'security') return demoLocalRoot;
+  if (key === 'health' || key === 'port') return demoLocalRoot;
   return '';
 }
 
