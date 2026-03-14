@@ -53,19 +53,32 @@
     return mobileWrapper;
   }
 
+  const ALL_PANELS = () => [timelinePanel, planPanel, auditPanel];
+
+  function hideAllPanels() {
+    ALL_PANELS().forEach(p => { if (p) p.style.display = 'none'; });
+  }
+
   // ── Tab switching ─────────────────────────────────────────
   function showTab(tabName) {
+    // Toggle: tapping the already-active non-terminal tab goes back to terminal
+    if (tabName !== 'terminal' && tabName === activeTab) {
+      showTab('terminal');
+      return;
+    }
+
     activeTab = tabName;
     tabBtns.forEach(btn => {
       btn.classList.toggle('is-active', btn.dataset.tab === tabName);
     });
 
     if (tabName === 'terminal') {
+      hideAllPanels();
       if (terminalPane) terminalPane.style.display = '';
       if (mobileWrapper) mobileWrapper.style.display = 'none';
       // Re-fit xterm after becoming visible
       requestAnimationFrame(() => {
-        if (window.fitAddon) window.fitAddon.fit();
+        if (typeof fitAddon !== 'undefined' && fitAddon) fitAddon.fit();
       });
       return;
     }
@@ -78,6 +91,9 @@
     const panelMap = { agents: timelinePanel, plan: planPanel, audit: auditPanel };
     const panel = panelMap[tabName];
     if (!panel) return;
+
+    // Hide all panels first, then show only the target
+    hideAllPanels();
 
     if (panel.parentElement !== wrapper) {
       wrapper.appendChild(panel);
@@ -210,11 +226,12 @@
 
   // ── Restore panels to side-pane on desktop ────────────────
   function teardown() {
+    activeTab = 'terminal';
     [timelinePanel, planPanel, auditPanel].forEach(panel => {
       if (panel && mobileWrapper && panel.parentElement === mobileWrapper && sidePaneEl) {
         sidePaneEl.appendChild(panel);
-        panel.style.cssText = '';
       }
+      if (panel) panel.style.cssText = '';
     });
     if (mobileWrapper) mobileWrapper.style.display = 'none';
     if (terminalPane) terminalPane.style.display = '';
