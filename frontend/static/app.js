@@ -1235,6 +1235,14 @@ function renderAuditReport(report) {
   auditContentEl.appendChild(exportBar);
 }
 
+function _updateAutoRunGroup() {
+  const group = document.getElementById('planAutoRunGroup');
+  if (!group) return;
+  for (const btn of group.querySelectorAll('.auto-run-btn')) {
+    btn.classList.toggle('active', btn.dataset.level === currentPlanAutoRunLevel);
+  }
+}
+
 function updatePlanOpBar() {
   if (!planOpBarEl) return;
   const hasPlan = !!(currentPlan && Array.isArray(currentPlan.nodes) && currentPlan.nodes.length);
@@ -1247,45 +1255,47 @@ function updatePlanOpBar() {
   const groundedCount = currentPlan.nodes.filter((node) => node.grounded).length;
   const preAudit = currentPlan && currentPlan.pre_audit ? currentPlan.pre_audit : null;
   const severity = String((preAudit && preAudit.severity) || '').trim().toLowerCase();
-  let autoRunSel = document.getElementById('planAutoRunSel');
-  if (!autoRunSel) {
-    const container = planOpTitleEl && planOpTitleEl.parentElement;
-    if (container) {
-      const wrap = document.createElement('div');
-      wrap.style.cssText = 'display:flex;align-items:center;gap:6px;margin-top:6px;font-size:12px;color:#94a3b8;';
+  // Auto-run segmented button group
+  let autoRunGroup = document.getElementById('planAutoRunGroup');
+  if (!autoRunGroup) {
+    const btnsBar = planOpTitleEl && planOpTitleEl.closest('.plan-op-bar');
+    if (btnsBar) {
+      const group = document.createElement('div');
+      group.id = 'planAutoRunGroup';
+      group.className = 'auto-run-group';
 
-      const label = document.createElement('span');
-      label.textContent = 'Auto-run';
-      wrap.appendChild(label);
+      const lbl = document.createElement('span');
+      lbl.className = 'auto-run-group-label';
+      lbl.textContent = 'Auto-run';
+      group.appendChild(lbl);
 
-      const sel = document.createElement('select');
-      sel.id = 'planAutoRunSel';
-      sel.style.cssText = 'background:#1e2230;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:2px 6px;font-size:12px;';
-
-      const opts = [['none', 'Off'], ['safe', 'Safe only'], ['safe_warn', 'Safe + warn']];
-      for (const [val, lbl] of opts) {
-        const opt = document.createElement('option');
-        opt.value = val;
-        opt.textContent = lbl;
-        sel.appendChild(opt);
-      }
-      wrap.appendChild(sel);
-      container.appendChild(wrap);
-
-      autoRunSel = sel;
-      sel.addEventListener('change', async () => {
-        currentPlanAutoRunLevel = sel.value;
-        if (currentPlan && currentPlan.id && currentPlanStream && currentPlanStream.source) {
-          try {
-            await apiPlanSetAutoRun(currentPlan.id, currentPlanAutoRunLevel);
-          } catch {
-            // ignore transient failures; next node keeps previous backend level
+      const opts = [['none', 'Off'], ['safe', 'Safe'], ['safe_warn', 'Safe+warn']];
+      for (const [val, text] of opts) {
+        const btn = document.createElement('button');
+        btn.className = 'auto-run-btn';
+        btn.dataset.level = val;
+        btn.textContent = text;
+        btn.addEventListener('click', async () => {
+          currentPlanAutoRunLevel = val;
+          _updateAutoRunGroup();
+          if (currentPlan && currentPlan.id && currentPlanStream && currentPlanStream.source) {
+            try { await apiPlanSetAutoRun(currentPlan.id, val); } catch { /* ignore */ }
           }
-        }
-      });
+        });
+        group.appendChild(btn);
+      }
+
+      // Insert before .plan-op-btns so it sits in the bar naturally
+      const planOpBtns = btnsBar.querySelector('.plan-op-btns');
+      if (planOpBtns) {
+        btnsBar.insertBefore(group, planOpBtns);
+      } else {
+        btnsBar.appendChild(group);
+      }
+      autoRunGroup = group;
     }
   }
-  if (autoRunSel) autoRunSel.value = currentPlanAutoRunLevel;
+  _updateAutoRunGroup();
   if (planPreAuditEl) {
     if (severity) {
       planPreAuditEl.dataset.severity = severity;
