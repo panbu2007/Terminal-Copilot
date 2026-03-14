@@ -327,6 +327,7 @@ let currentPlanIntent = '';
 let currentAuditReport = null;
 let currentSuggestStream = null;
 let currentPlanStream = null;
+let currentPlanAutoRunLevel = 'none';
 let latestRunbookItems = [];
 let currentPlanNodeOutputs = {};
 let currentPlanNodeStatuses = {};
@@ -550,6 +551,7 @@ class PlanGraphRenderer {
     this.editMode = false;
     this.zoom = null;
     this.currentTransform = null;
+    this.onNodeClick = null;
   }
 
   clear() {
@@ -586,6 +588,7 @@ class PlanGraphRenderer {
 
   render(plan, { onNodeClick } = {}) {
     this.plan = plan;
+    this.onNodeClick = typeof onNodeClick === 'function' ? onNodeClick : null;
     if (!this.container) return;
     if (!plan || !Array.isArray(plan.nodes) || plan.nodes.length === 0) {
       this.clear();
@@ -697,7 +700,7 @@ class PlanGraphRenderer {
         })
         .on('click', (event) => {
           event.stopPropagation();
-          if (typeof onNodeClick === 'function') onNodeClick(node, event.currentTarget);
+          if (this.onNodeClick) this.onNodeClick(node, event.currentTarget);
         });
 
       const w = layoutNode.width;
@@ -838,6 +841,63 @@ class PlanGraphRenderer {
         .classed('edge-failed', normalized === 'failed');
     }
   }
+
+  appendNodes(newNodes, newEdges) {
+    if (!this.plan || !Array.isArray(newNodes) || !newNodes.length) return;
+
+    const existingNodeIds = new Set((this.plan.nodes || []).map((node) => node.id));
+    const existingEdgeKeys = new Set(
+      (this.plan.edges || []).map((edge) => `${edge.source_id}|${edge.target_id}|${edge.condition || ''}|${edge.label || ''}`)
+    );
+
+    const appendedNodeIds = [];
+    const mergedNodes = [...(this.plan.nodes || [])];
+    for (const node of newNodes) {
+      if (existingNodeIds.has(node.id)) continue;
+      existingNodeIds.add(node.id);
+      mergedNodes.push(node);
+      appendedNodeIds.push(node.id);
+      currentPlanNodeStatuses[node.id] = currentPlanNodeStatuses[node.id] || 'pending';
+      currentPlanNodeOutputs[node.id] = currentPlanNodeOutputs[node.id] || { stdout: '', stderr: '', exit_code: null };
+    }
+
+    const mergedEdges = [...(this.plan.edges || [])];
+    for (const edge of (Array.isArray(newEdges) ? newEdges : [])) {
+      const key = `${edge.source_id}|${edge.target_id}|${edge.condition || ''}|${edge.label || ''}`;
+      if (existingEdgeKeys.has(key)) continue;
+      existingEdgeKeys.add(key);
+      mergedEdges.push(edge);
+    }
+
+    if (!appendedNodeIds.length) return;
+
+    const prevStatuses = { ...currentPlanNodeStatuses };
+    this.plan.nodes = mergedNodes;
+    this.plan.edges = mergedEdges;
+    if (currentPlan) {
+      currentPlan.nodes = mergedNodes;
+      currentPlan.edges = mergedEdges;
+    }
+
+    this.render(this.plan, { onNodeClick: this.onNodeClick });
+
+    for (const [nodeId, status] of Object.entries(prevStatuses)) {
+      this.updateNodeStatus(nodeId, status);
+    }
+    for (const nodeId of appendedNodeIds) {
+      const nodeEl = this.nodeEls.get(nodeId);
+      if (!nodeEl) continue;
+      nodeEl.classed('plan-node-appended', true);
+      nodeEl.select('.node-bg').attr('stroke-dasharray', '6 3');
+      nodeEl.select('.badge-icon').text('+');
+    }
+
+    updatePlanOpBar();
+    if (currentPopoverNodeId) {
+      const current = getCurrentPlanNode(currentPopoverNodeId);
+      if (current) openNodePopover(current, null, currentPlanNodeStatuses[currentPopoverNodeId] === 'awaiting_approval');
+    }
+  }
 }
 
 class PlanStreamClient {
@@ -866,6 +926,23 @@ class PlanStreamClient {
   handleEvent(payload) {
     if (!payload || !payload.type) return;
     if (payload.type === 'heartbeat') return;
+    if (payload.type === 'replan_starting') {
+      const nodeEl = this.renderer.nodeEls.get(payload.failed_node_id);
+      if (nodeEl) nodeEl.select('.badge-icon').text('...');
+      writePlanTerminalLine('[REPLAN] Generating follow-up steps...', '\x1b[33m');
+      return;
+    }
+    if (payload.type === 'nodes_appended') {
+      const newNodes = Array.isArray(payload.nodes) ? payload.nodes : [];
+      const newEdges = Array.isArray(payload.edges) ? payload.edges : [];
+      this.renderer.appendNodes(newNodes, newEdges);
+      writePlanTerminalLine(`[REPLAN] Appended ${newNodes.length} follow-up node(s).`, '\x1b[32m');
+      return;
+    }
+    if (payload.type === 'replan_failed') {
+      writePlanTerminalLine(`[REPLAN] Extension unavailable: ${payload.reason || 'no follow-up generated'}`, '\x1b[33m');
+      return;
+    }
     if (payload.type === 'node_start') {
       currentPlanNodeStatuses[payload.node_id] = 'running';
       trackPlanNodeStart(payload.node_id, payload.command || '');
@@ -1170,6 +1247,45 @@ function updatePlanOpBar() {
   const groundedCount = currentPlan.nodes.filter((node) => node.grounded).length;
   const preAudit = currentPlan && currentPlan.pre_audit ? currentPlan.pre_audit : null;
   const severity = String((preAudit && preAudit.severity) || '').trim().toLowerCase();
+  let autoRunSel = document.getElementById('planAutoRunSel');
+  if (!autoRunSel) {
+    const container = planOpTitleEl && planOpTitleEl.parentElement;
+    if (container) {
+      const wrap = document.createElement('div');
+      wrap.style.cssText = 'display:flex;align-items:center;gap:6px;margin-top:6px;font-size:12px;color:#94a3b8;';
+
+      const label = document.createElement('span');
+      label.textContent = 'Auto-run';
+      wrap.appendChild(label);
+
+      const sel = document.createElement('select');
+      sel.id = 'planAutoRunSel';
+      sel.style.cssText = 'background:#1e2230;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:2px 6px;font-size:12px;';
+
+      const opts = [['none', 'Off'], ['safe', 'Safe only'], ['safe_warn', 'Safe + warn']];
+      for (const [val, lbl] of opts) {
+        const opt = document.createElement('option');
+        opt.value = val;
+        opt.textContent = lbl;
+        sel.appendChild(opt);
+      }
+      wrap.appendChild(sel);
+      container.appendChild(wrap);
+
+      autoRunSel = sel;
+      sel.addEventListener('change', async () => {
+        currentPlanAutoRunLevel = sel.value;
+        if (currentPlan && currentPlan.id && currentPlanStream && currentPlanStream.source) {
+          try {
+            await apiPlanSetAutoRun(currentPlan.id, currentPlanAutoRunLevel);
+          } catch {
+            // ignore transient failures; next node keeps previous backend level
+          }
+        }
+      });
+    }
+  }
+  if (autoRunSel) autoRunSel.value = currentPlanAutoRunLevel;
   if (planPreAuditEl) {
     if (severity) {
       planPreAuditEl.dataset.severity = severity;
@@ -2026,7 +2142,12 @@ async function apiPlanGenerate(intent, suggestions = []) {
 async function apiPlanExecute(planId) {
   return postJson(`/api/plan/${encodeURIComponent(planId)}/execute`, {
     session_id: getSessionId() || null,
+    auto_run_level: currentPlanAutoRunLevel,
   });
+}
+
+async function apiPlanSetAutoRun(planId, level) {
+  return postJson(`/api/plan/${encodeURIComponent(planId)}/auto-run`, { level });
 }
 
 async function apiPlanApproveNode(planId, nodeId) {
