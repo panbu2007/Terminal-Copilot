@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 import logging
 import re
+from uuid import uuid4
 
 from .base import AgentMessage, BaseAgent
 from .tools import TOOLS
+from ..models import ExecutionPlan, PlanEdge, PlanNode
 
 logger = logging.getLogger("terminal_copilot.executor_agent")
 
 _JSON_ARRAY_RE = re.compile(r"\[[\s\S]*\]", re.MULTILINE)
+_JSON_OBJECT_RE = re.compile(r"\{[\s\S]*\}", re.MULTILINE)
 
 # ExecutorAgent 使用的工具子集（搜索知识库 + 生成命令建议）
 _EXECUTOR_TOOLS = [t for t in TOOLS if t["function"]["name"] in {"search_runbook", "execute_command"}]
@@ -151,6 +155,57 @@ class ExecutorAgent(BaseAgent):
     def _generate_plain(self, user_content: str) -> str:
         return self._llm(user_content, max_tokens=600, temperature=0.2)
 
+    def generate_dag(
+        self,
+        intent: str,
+        platform: str | None = None,
+    ) -> ExecutionPlan | None:
+        """Generate a DAG execution plan via the LLM."""
+
+        if not (intent or "").strip():
+            return None
+
+        platform_name = (platform or "linux").strip() or "linux"
+        prompt = (
+            "Return a JSON object representing an execution plan.\n"
+            "JSON schema:\n"
+            '{'
+            '"nodes":[{"id":"str","type":"diagnose|command|condition|verify|rollback|end|human",'
+            '"title":"str","command":"str","risk_level":"safe|warn|block","description":"str"}],'
+            '"edges":[{"source_id":"str","target_id":"str","condition":"success|failure|always","label":"str"}]'
+            '}\n'
+            "Use success/failure edges directly on command nodes for branching.\n"
+            "Do not use markdown. Return JSON only.\n"
+            f"Platform: {platform_name}\n"
+            f"Intent: {intent}"
+        )
+
+        last_error = ""
+        for attempt in range(2):
+            raw = self._llm(
+                prompt
+                if attempt == 0
+                else (
+                    f"{prompt}\n"
+                    "Your previous response was invalid.\n"
+                    f"Validation error: {last_error}\n"
+                    "Return corrected JSON only."
+                ),
+                max_tokens=900,
+                temperature=0.1,
+            )
+            try:
+                return self._parse_execution_plan(raw, intent=intent)
+            except Exception as exc:
+                last_error = str(exc)[:400]
+                logger.warning(
+                    "generate_dag parse failed attempt=%s err=%s",
+                    attempt + 1,
+                    last_error,
+                )
+
+        return None
+
     def _parse(self, text: str) -> list[dict]:
         m = _JSON_ARRAY_RE.search(text)
         if m:
@@ -179,3 +234,46 @@ class ExecutorAgent(BaseAgent):
                 "verify": str(item.get("verify", "")).strip(),
             })
         return out
+
+    def _parse_execution_plan(self, text: str, *, intent: str) -> ExecutionPlan:
+        match = _JSON_OBJECT_RE.search(text or "")
+        if not match:
+            raise ValueError("json_object_not_found")
+
+        payload = json.loads(match.group(0))
+        if not isinstance(payload, dict):
+            raise ValueError("plan_payload_not_object")
+
+        raw_nodes = payload.get("nodes")
+        raw_edges = payload.get("edges")
+        if not isinstance(raw_nodes, list) or not raw_nodes:
+            raise ValueError("nodes_missing")
+        if not isinstance(raw_edges, list):
+            raise ValueError("edges_missing")
+
+        nodes = [PlanNode.model_validate(item) for item in raw_nodes]
+        node_ids = {node.id for node in nodes}
+        edges: list[PlanEdge] = []
+        for item in raw_edges:
+            edge = PlanEdge.model_validate(item)
+            if edge.source_id not in node_ids or edge.target_id not in node_ids:
+                raise ValueError(
+                    f"edge_references_unknown_node:{edge.source_id}->{edge.target_id}"
+                )
+            edges.append(edge)
+
+        child_ids = {edge.target_id for edge in edges}
+        root_id = next(
+            (node.id for node in nodes if node.id not in child_ids),
+            nodes[0].id,
+        )
+
+        return ExecutionPlan(
+            id=str(uuid4()),
+            intent=intent,
+            nodes=nodes,
+            edges=edges,
+            root_id=root_id,
+            generated_by="executor_agent",
+            created_at=datetime.now(timezone.utc).isoformat(),
+        )

@@ -36,6 +36,9 @@ class CommandSuggestion(BaseModel):
     # 防幻觉置信度标签
     confidence: str = ""  # "high" | "medium" | "low"
     confidence_label: str = ""  # "✓ RAG验证" | "⚠ 未经验证" | "✗ 语法存疑"
+    # 意图对齐检测（LLM 语义判断）
+    alignment: str = ""         # "ok" | "warn" | "mismatch"
+    alignment_reason: str = ""
 
 
 class SuggestRequest(BaseModel):
@@ -191,6 +194,7 @@ class ExecutionPlan(BaseModel):
     root_id: str = ""
     generated_by: str = "planner"
     created_at: str
+    pre_audit: dict | None = None
 
 
 class PlanGenerateRequest(BaseModel):

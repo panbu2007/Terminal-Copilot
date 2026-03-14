@@ -145,9 +145,13 @@ def _execute_plan(state: PlanExecutionState) -> None:  # noqa: C901
             )
             if follows:
                 queue.append(tgt)
-            else:
-                # Mark skipped nodes reachable only via blocked edges
-                _skip_reachable(state, tgt, nodes, out_edges, visited)
+
+    for nid in nodes:
+        if nid in visited:
+            continue
+        if state.node_statuses.get(nid) in {"pending", "awaiting_approval"}:
+            state.node_statuses[nid] = "skipped"
+            _emit(state, {"type": "node_skipped", "node_id": nid, "reason": "unreachable"})
 
     # Build audit report
     total = len(nodes)
@@ -187,25 +191,6 @@ def _execute_plan(state: PlanExecutionState) -> None:  # noqa: C901
     _emit(state, None)  # sentinel
 
     state.status = "completed" if not has_fail else "failed"
-
-
-def _skip_reachable(
-    state: PlanExecutionState,
-    node_id: str,
-    nodes: dict[str, PlanNode],
-    out_edges: dict[str, list[tuple[str, str]]],
-    visited: set[str],
-) -> None:
-    """Recursively mark unreachable nodes as skipped."""
-    if node_id in visited:
-        return
-    visited.add(node_id)
-    state.node_statuses[node_id] = "skipped"
-    _emit(state, {"type": "node_skipped", "node_id": node_id, "reason": "unreachable"})
-    for (tgt, _) in out_edges.get(node_id, []):
-        _skip_reachable(state, tgt, nodes, out_edges, visited)
-
-
 def _execute_node(state: PlanExecutionState, node: PlanNode) -> str:
     """Execute a single node; return final status string."""
     nid = node.id

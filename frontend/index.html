@@ -1,4 +1,4 @@
-﻿<!doctype html>
+<!doctype html>
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
@@ -39,25 +39,25 @@
         <span class="onboarding-icon">🤖</span>
         <div>
           <div class="onboarding-title">Terminal Copilot - Web 终端智能副驾</div>
-          <div class="onboarding-subtitle">30 秒体验 AI 运维助手，点击下方场景即可开始</div>
+          <div class="onboarding-subtitle">30 秒体验可审计的 AI 运维执行引擎，点击下方场景即可开始</div>
         </div>
         <button id="onboardingClose" class="onboarding-close" aria-label="关闭引导">×</button>
       </div>
       <div class="quick-demos">
-        <button class="demo-btn" data-demo="port" type="button">
-          <span class="demo-icon">📌</span>
-          <span class="demo-label">查端口占用</span>
-          <span class="demo-desc">端口 8000 被占用了怎么办</span>
+        <button class="demo-btn" data-demo="health" type="button">
+          <span class="demo-icon">🏥</span>
+          <span class="demo-label">服务器巡检</span>
+          <span class="demo-desc">全面检查磁盘、内存、进程健康状态</span>
         </button>
-        <button class="demo-btn" data-demo="docker" type="button">
-          <span class="demo-icon">🐳</span>
-          <span class="demo-label">Docker 换源</span>
-          <span class="demo-desc">配置国内镜像加速 Docker</span>
+        <button class="demo-btn" data-demo="deploy" type="button">
+          <span class="demo-icon">🚀</span>
+          <span class="demo-label">上线验证</span>
+          <span class="demo-desc">验证刚部署的服务是否正常运行</span>
         </button>
-        <button class="demo-btn" data-demo="git" type="button">
-          <span class="demo-icon">🔧</span>
-          <span class="demo-label">修复 Git 拼写</span>
-          <span class="demo-desc">git chekcout main 命令拼写错了</span>
+        <button class="demo-btn" data-demo="security" type="button">
+          <span class="demo-icon">🛡️</span>
+          <span class="demo-label">安全审查</span>
+          <span class="demo-desc">扫描端口、权限、异常进程，生成审计报告</span>
         </button>
         <button class="demo-btn" data-demo="custom" type="button">
           <span class="demo-icon">💬</span>
@@ -71,7 +71,7 @@
       <section class="terminal-pane">
         <div class="terminal-toolbar">
           <button id="askAi" class="btn-export" type="button">Ask AI</button>
-          <span class="terminal-toolbar-hint">PTY 模式下点击提问，AI 会结合最近终端上下文给出建议</span>
+          <span class="terminal-toolbar-hint">直接在终端中输入命令或问题，系统会自动判断是否走 AI 分析</span>
         </div>
         <div id="terminal" class="terminal"></div>
         <div id="hint" class="hint"></div>

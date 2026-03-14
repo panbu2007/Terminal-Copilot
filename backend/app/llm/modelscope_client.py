@@ -19,6 +19,7 @@ from ..local_secrets import (
 
 logger = logging.getLogger("terminal_copilot.llm")
 DEFAULT_TIMEOUT_SECONDS = 20.0
+_DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 @dataclass(frozen=True)
@@ -139,6 +140,40 @@ def _ensure_base_url(base_url: str) -> str:
     return s if s.endswith("/") else s + "/"
 
 
+def urlopen_without_proxy(req: urllib.request.Request, *, timeout: float):
+    return _DIRECT_OPENER.open(req, timeout=timeout)
+
+
+def normalize_chat_temperature(
+    *,
+    provider: str | None,
+    base_url: str | None,
+    model: str | None,
+    temperature: float,
+) -> float:
+    normalized_provider = normalize_provider(provider)
+    normalized_base_url = (base_url or "").strip().lower()
+    normalized_model = (model or "").strip().lower()
+    is_kimi_k25 = normalized_model in {
+        "kimi-k2.5",
+        "moonshotai/kimi-k2.5",
+    }
+    if not is_kimi_k25:
+        return temperature
+    if normalized_provider != "kimi" and "moonshot.cn" not in normalized_base_url:
+        return temperature
+    if temperature == 1 or temperature == 1.0:
+        return 1.0
+    logger.info(
+        "llm_temperature_override provider=%s model=%s base_url=%s old=%s new=1.0",
+        normalized_provider,
+        model,
+        base_url,
+        temperature,
+    )
+    return 1.0
+
+
 def resolve_llm_config(
     *,
     provider_override: str | None = None,
@@ -222,7 +257,7 @@ def modelscope_chat_with_tools(
     tools: list[dict],
     temperature: float = 0.2,
     max_tokens: int = 800,
-) -> tuple[str, list[dict]]:
+) -> tuple[str, list[dict], dict]:
     """Call selected OpenAI-compatible chat/completions with function calling enabled."""
     cfg = _env_config()
     if cfg is None:
@@ -240,6 +275,12 @@ def modelscope_chat_with_tools(
     )
 
     url = cfg.base_url + "chat/completions"
+    temperature = normalize_chat_temperature(
+        provider=cfg.provider,
+        base_url=cfg.base_url,
+        model=cfg.model,
+        temperature=temperature,
+    )
     payload: dict = {
         "model": cfg.model,
         "messages": messages,
@@ -262,7 +303,7 @@ def modelscope_chat_with_tools(
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=cfg.timeout_seconds) as resp:
+        with urlopen_without_proxy(req, timeout=cfg.timeout_seconds) as resp:
             body = resp.read().decode("utf-8")
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="ignore") if hasattr(e, "read") else ""
@@ -294,15 +335,25 @@ def modelscope_chat_with_tools(
         msg = first.get("message", {}) if isinstance(first, dict) else {}
         content = msg.get("content") or ""
         tool_calls = msg.get("tool_calls") or []
+        reasoning_content = msg.get("reasoning_content")
+        assistant_message = {
+            "role": "assistant",
+            "content": str(content),
+        }
+        if tool_calls:
+            assistant_message["tool_calls"] = tool_calls
+        if reasoning_content not in (None, ""):
+            assistant_message["reasoning_content"] = reasoning_content
         logger.info(
-            "llm_chat_with_tools done provider=%s model=%s cost=%sms content_len=%s tool_calls=%s",
+            "llm_chat_with_tools done provider=%s model=%s cost=%sms content_len=%s tool_calls=%s reasoning_len=%s",
             cfg.provider,
             cfg.model,
             int((time.perf_counter() - t0) * 1000),
             len(str(content)),
             len(tool_calls if isinstance(tool_calls, list) else []),
+            len(str(reasoning_content or "")),
         )
-        return str(content), tool_calls
+        return str(content), tool_calls, assistant_message
     except RuntimeError:
         raise
     except Exception as e:
@@ -335,6 +386,12 @@ def modelscope_chat_completion(
     )
 
     url = cfg.base_url + "chat/completions"
+    temperature = normalize_chat_temperature(
+        provider=cfg.provider,
+        base_url=cfg.base_url,
+        model=cfg.model,
+        temperature=temperature,
+    )
     payload = {
         "model": cfg.model,
         "messages": messages,
@@ -354,7 +411,7 @@ def modelscope_chat_completion(
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=cfg.timeout_seconds) as resp:
+        with urlopen_without_proxy(req, timeout=cfg.timeout_seconds) as resp:
             body = resp.read().decode("utf-8")
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="ignore") if hasattr(e, "read") else ""

@@ -12,6 +12,9 @@ echo "[deploy] app_dir=${APP_DIR}"
 echo "[deploy] branch=${BRANCH}"
 echo "[deploy] service=${SERVICE}"
 
+scp -o BatchMode=yes -o StrictHostKeyChecking=no \
+  scripts/setup_terminal_privilege_mode.sh "${HOST}:${APP_DIR}/scripts/setup_terminal_privilege_mode.sh"
+
 ssh -o BatchMode=yes -o StrictHostKeyChecking=no "${HOST}" bash <<EOF
 set -euo pipefail
 
@@ -26,6 +29,9 @@ fi
 
 source .venv/bin/activate
 pip install -r requirements.txt
+
+chmod +x scripts/setup_terminal_privilege_mode.sh
+./scripts/setup_terminal_privilege_mode.sh "${APP_DIR}" "${SERVICE}"
 
 systemctl restart "${SERVICE}"
 sleep 3
@@ -44,4 +50,7 @@ echo
 
 echo "--- service ---"
 systemctl --no-pager --full status "${SERVICE}" | sed -n '1,40p'
+
+echo "--- pty user ---"
+systemctl show -p Environment "${SERVICE}" | sed -n '1,20p'
 EOF

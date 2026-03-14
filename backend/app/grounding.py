@@ -111,3 +111,74 @@ def annotate_confidence(
             s.confidence_label = "✗ 语法存疑"
 
     return suggestions
+
+
+def async_alignment_check(
+    intent: str,
+    suggestions: list[CommandSuggestion],
+) -> list[CommandSuggestion]:
+    """Use the configured LLM to check semantic intent alignment."""
+
+    if not suggestions or not (intent or "").strip():
+        return suggestions
+
+    try:
+        from .llm.modelscope_client import (
+            modelscope_chat_completion,
+            modelscope_is_configured,
+        )
+
+        if not modelscope_is_configured():
+            return suggestions
+
+        items = [
+            {"id": s.id, "title": s.title, "command": s.command}
+            for s in suggestions
+            if (s.command or "").strip() and s.command != "(auto)"
+        ]
+        if not items:
+            return suggestions
+
+        prompt = (
+            "Review whether each terminal command suggestion is aligned with the user intent.\n"
+            f"Intent: {intent}\n"
+            "Return JSON only as an array.\n"
+            'Each item must be {"id": "...", "alignment": "ok|warn|mismatch", "reason": "..."}.\n'
+            f"Suggestions: {items!r}"
+        )
+        raw = modelscope_chat_completion(
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You audit command intent alignment. Return strict JSON only.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.1,
+            max_tokens=400,
+        )
+
+        import json as _json
+
+        match = re.search(r"\[[\s\S]*\]", raw or "")
+        if not match:
+            return suggestions
+        payload = _json.loads(match.group(0))
+        if not isinstance(payload, list):
+            return suggestions
+
+        by_id = {
+            str(item.get("id", "")).strip(): item
+            for item in payload
+            if isinstance(item, dict) and str(item.get("id", "")).strip()
+        }
+        for suggestion in suggestions:
+            item = by_id.get(suggestion.id)
+            if not item:
+                continue
+            suggestion.alignment = str(item.get("alignment", "")).strip()
+            suggestion.alignment_reason = str(item.get("reason", "")).strip()
+    except Exception:
+        return suggestions
+
+    return suggestions

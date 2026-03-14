@@ -1,4 +1,4 @@
-﻿/* global Terminal, FitAddon */
+/* global Terminal, FitAddon */
 
 const statusEl = document.getElementById('status');
 const stepsEl = document.getElementById('steps');
@@ -54,6 +54,8 @@ const nodePopoverEl = document.getElementById('nodePopover');
 const nodePopoverTitleEl = document.getElementById('nodePopoverTitle');
 const nodePopoverBodyEl = document.getElementById('nodePopoverBody');
 const nodePopoverCloseEl = document.getElementById('nodePopoverClose');
+const topbarEl = document.querySelector('.topbar');
+const layoutEl = document.querySelector('.layout');
 const onboardingEl = document.getElementById('onboarding');
 const onboardingCloseEl = document.getElementById('onboardingClose');
 const demoBtnEls = Array.from(document.querySelectorAll('.demo-btn'));
@@ -68,7 +70,7 @@ const runbookListEl = document.getElementById('runbookList');
 
 let currentExecutorMode = '';
 let ptySupported = false;
-let terminalMode = 'pty';
+let terminalMode = 'plan';
 let ptyWebSocket = null;
 let termDataDisposable = null;
 let termResizeDisposable = null;
@@ -77,6 +79,8 @@ let ptyControlSeq = 0;
 
 // cwd prompt
 let currentCwd = '';
+let demoLocalRoot = '';
+let demoWorkspaceAvailable = false;
 
 // Track what prompt prefix is currently rendered on the active input line.
 // Used to compute minimal overwrite lengths without clearing the whole line (reduces flicker).
@@ -276,10 +280,38 @@ function clearTimeline() {
 }
 
 const DEMO_INTENTS = {
-  port: '端口 8000 被占用了怎么办？请生成排查和修复执行计划。',
-  docker: '帮我配置 Docker 国内镜像源，并给出可以验证是否生效的执行计划。',
-  git: '我输入了 git chekcout main，帮我诊断并生成修复执行计划。',
+  health: '对这台服务器做一次全面健康巡检：检查磁盘空间、内存使用、CPU 负载、异常进程，有问题就修复，最后生成巡检报告。',
+  deploy: '刚部署了一个服务，帮我验证它是否正常运行：检查进程是否存活、端口是否监听、健康接口是否响应、依赖是否完整。',
+  security: '对这台服务器做一次安全审查：扫描开放端口、检查可登录用户、查找异常进程、检查 SUID 文件权限，生成安全审计报告。',
 };
+
+function joinDemoPath(base, child) {
+  const root = String(base || '').trim().replace(/[\\/]+$/, '');
+  if (!root) return '';
+  const sep = root.includes('\\') && !root.includes('/') ? '\\' : '/';
+  return `${root}${sep}${child}`;
+}
+
+function quoteCdPath(target) {
+  return `"${String(target || '').replace(/"/g, '\\"')}"`;
+}
+
+function getDemoTargetCwd(key) {
+  if (!demoLocalRoot) return '';
+  if (key === 'deploy' && demoWorkspaceAvailable) return joinDemoPath(demoLocalRoot, 'workspace');
+  if (key === 'health' || key === 'security') return demoLocalRoot;
+  return '';
+}
+
+async function ensureDemoContext(key) {
+  const target = getDemoTargetCwd(key);
+  if (!target || String(currentCwd || '') === target) return;
+  const execRes = await apiExecute(`cd ${quoteCdPath(target)}`, false);
+  if (execRes && typeof execRes.cwd === 'string' && execRes.cwd) {
+    currentCwd = execRes.cwd;
+    refreshPrompt();
+  }
+}
 
 const AGENT_META = [
   { key: 'orchestrator', label: 'Orchestrator', icon: '◎' },
@@ -374,6 +406,37 @@ function switchSidePanel(name) {
       });
     });
   }
+}
+
+function refreshResponsiveLayout() {
+  requestAnimationFrame(() => {
+    try {
+      if (fitAddon) fitAddon.fit();
+    } catch {
+      // ignore
+    }
+
+    try {
+      if (currentPlan) planRenderer.fit();
+    } catch {
+      // ignore
+    }
+
+    try {
+      if (
+        nodePopoverEl &&
+        !nodePopoverEl.classList.contains('hidden') &&
+        currentPopoverNodeId &&
+        currentPlan &&
+        Array.isArray(currentPlan.nodes)
+      ) {
+        const node = currentPlan.nodes.find((item) => item && item.id === currentPopoverNodeId);
+        if (node) openNodePopover(node, null, pendingPlanApprovals.has(node.id));
+      }
+    } catch {
+      // ignore
+    }
+  });
 }
 
 function setPlanUnread(hasUnread) {
@@ -580,7 +643,7 @@ class PlanGraphRenderer {
     this.viewport = viewport;
     this.content = content;
     this.zoom = d3.zoom()
-      .scaleExtent([0.35, 2.5])
+      .scaleExtent([0.1, 5])
       .on('zoom', (event) => {
         this.currentTransform = event.transform;
         this.viewport.attr('transform', event.transform);
@@ -706,7 +769,16 @@ class PlanGraphRenderer {
 
   truncate(text, max) {
     const value = String(text || '');
-    return value.length > max ? `${value.slice(0, max - 1)}…` : value;
+    let width = 0;
+    let result = '';
+    for (const char of value) {
+      // CJK and full-width characters count as 2 units
+      const w = /[\u1100-\u115f\u2e80-\u9fff\uac00-\ud7a3\uf900-\ufaff\ufe10-\ufe19\ufe30-\ufe6f\uff01-\uff60\uffe0-\uffe6]/.test(char) ? 2 : 1;
+      if (width + w > max) { result += '…'; break; }
+      result += char;
+      width += w;
+    }
+    return result;
   }
 
   fit() {
@@ -718,7 +790,7 @@ class PlanGraphRenderer {
     const width = Math.max(this.container.clientWidth || 320, 320);
     const height = Math.max(this.container.clientHeight || 320, 320);
     if (width <= 0 || height <= 0) return;
-    const scale = Math.min(width / (bounds.width + 48), height / (bounds.height + 48), 1);
+    const scale = Math.min(width / (bounds.width + 48), height / (bounds.height + 48));
     const offsetX = (width - bounds.width * scale) / 2 - bounds.x * scale;
     const offsetY = (height - bounds.height * scale) / 2 - bounds.y * scale;
     this.scale = scale;
@@ -918,6 +990,67 @@ function appendNodeStdout(nodeId, chunk) {
   };
 }
 
+function renderPreAuditCard(preAudit) {
+  const existing = document.getElementById('planPreAuditCard');
+  if (existing) existing.remove();
+  if (!preAudit || !Array.isArray(preAudit.findings) || !preAudit.findings.length) return;
+
+  const card = document.createElement('div');
+  card.id = 'planPreAuditCard';
+  card.style.marginTop = '8px';
+
+  const severity = String(preAudit.severity || 'pass').toLowerCase();
+  const severityClass = severity === 'fail' ? 'fail' : severity === 'warn' ? 'warn' : 'info';
+
+  const header = document.createElement('div');
+  header.className = 'audit-finding severity-' + severityClass;
+  const headerTitle = document.createElement('div');
+  headerTitle.className = 'audit-finding-header';
+  headerTitle.textContent = '执行前预审 · ' + severity.toUpperCase();
+  header.appendChild(headerTitle);
+  const headerMsg = document.createElement('div');
+  headerMsg.className = 'audit-finding-msg';
+  headerMsg.textContent = String(preAudit.summary || '');
+  header.appendChild(headerMsg);
+  card.appendChild(header);
+
+  let showFindings = false;
+  const toggle = document.createElement('div');
+  toggle.className = 'explain';
+  toggle.style.cursor = 'pointer';
+  toggle.style.marginTop = '4px';
+  const findingsContainer = document.createElement('div');
+  findingsContainer.style.display = 'none';
+
+  const updateToggle = () => {
+    toggle.textContent = (showFindings ? '▼ ' : '▶ ') + '查看 ' + preAudit.findings.length + ' 条详情';
+    findingsContainer.style.display = showFindings ? '' : 'none';
+  };
+  updateToggle();
+  toggle.onclick = () => { showFindings = !showFindings; updateToggle(); };
+  card.appendChild(toggle);
+  card.appendChild(findingsContainer);
+
+  for (const f of preAudit.findings) {
+    const fc = String(f.severity || 'info').toLowerCase();
+    const row = document.createElement('div');
+    row.className = 'audit-finding severity-' + (fc === 'fail' ? 'fail' : fc === 'warn' ? 'warn' : 'info');
+    const rowTitle = document.createElement('div');
+    rowTitle.className = 'audit-finding-header';
+    rowTitle.textContent = String(f.title || '');
+    row.appendChild(rowTitle);
+    const rowMsg = document.createElement('div');
+    rowMsg.className = 'audit-finding-msg';
+    rowMsg.textContent = String(f.message || '');
+    row.appendChild(rowMsg);
+    findingsContainer.appendChild(row);
+  }
+
+  if (planGraphEl && planGraphEl.parentNode) {
+    planGraphEl.parentNode.insertBefore(card, planGraphEl.nextSibling);
+  }
+}
+
 function renderAuditReport(report) {
   currentAuditReport = report || null;
   if (!auditContentEl) return;
@@ -1034,7 +1167,21 @@ function updatePlanOpBar() {
   planOpCountEl.textContent = `${currentPlan.nodes.length} nodes`;
   const warnCount = currentPlan.nodes.filter((node) => node.risk_level === 'warn').length;
   const blockCount = currentPlan.nodes.filter((node) => node.risk_level === 'block').length;
-  planPreAuditEl.textContent = `预审查: ${warnCount} 个 warn，${blockCount} 个 block，${currentPlan.nodes.filter((node) => node.grounded).length}/${currentPlan.nodes.length} 个节点有依据`;
+  const groundedCount = currentPlan.nodes.filter((node) => node.grounded).length;
+  const preAudit = currentPlan && currentPlan.pre_audit ? currentPlan.pre_audit : null;
+  const severity = String((preAudit && preAudit.severity) || '').trim().toLowerCase();
+  if (planPreAuditEl) {
+    if (severity) {
+      planPreAuditEl.dataset.severity = severity;
+    } else {
+      delete planPreAuditEl.dataset.severity;
+    }
+  }
+  if (preAudit && preAudit.summary) {
+    planPreAuditEl.textContent = `Pre-audit ${String(preAudit.severity || 'pass').toUpperCase()}: ${String(preAudit.summary || '')} · ${warnCount} warn · ${blockCount} block · ${groundedCount}/${currentPlan.nodes.length} grounded`;
+    return;
+  }
+  planPreAuditEl.textContent = `Pre-audit pending · ${warnCount} warn · ${blockCount} block · ${groundedCount}/${currentPlan.nodes.length} grounded`;
 }
 
 function renderNodePopoverBody(node, forceApproval = false) {
@@ -1102,16 +1249,19 @@ function openNodePopover(node, target, forceApproval = false) {
   currentPopoverNodeId = node.id || '';
   nodePopoverTitleEl.textContent = node.title || node.id;
   renderNodePopoverBody(node, forceApproval);
+  const popoverWidth = Math.min(300, Math.max(240, window.innerWidth - 24));
+  const popoverHeight = Math.min(360, Math.max(220, window.innerHeight - 96));
   const currentLeft = parseInt(nodePopoverEl.style.left || '0', 10);
   const currentTop = parseInt(nodePopoverEl.style.top || '0', 10);
   const hasPinnedPosition = !Number.isNaN(currentLeft) && !Number.isNaN(currentTop) && !target;
   const rect = target && target.getBoundingClientRect
     ? target.getBoundingClientRect()
     : hasPinnedPosition
-      ? { right: currentLeft + 300, top: currentTop }
+      ? { right: currentLeft + popoverWidth, top: currentTop }
       : { right: window.innerWidth / 2, top: window.innerHeight / 2 };
-  nodePopoverEl.style.left = `${Math.max(12, Math.min(window.innerWidth - 320, rect.right + 8))}px`;
-  nodePopoverEl.style.top = `${Math.max(76, Math.min(window.innerHeight - 360, rect.top))}px`;
+  nodePopoverEl.style.width = `${popoverWidth}px`;
+  nodePopoverEl.style.left = `${Math.max(12, Math.min(window.innerWidth - popoverWidth - 12, rect.right + 8))}px`;
+  nodePopoverEl.style.top = `${Math.max(76, Math.min(window.innerHeight - popoverHeight - 12, rect.top))}px`;
   nodePopoverEl.classList.remove('hidden');
 }
 
@@ -1135,6 +1285,7 @@ function renderPlan(plan, intent) {
   planRenderer.render(plan, {
     onNodeClick: (node, target) => openNodePopover(node, target),
   });
+  renderPreAuditCard((plan && plan.pre_audit) ? plan.pre_audit : null);
   setPlanUnread(true);
 }
 
@@ -1156,17 +1307,102 @@ function closePlanStream() {
   }
 }
 
+const SHELL_COMMAND_PREFIX_RE = /^(git|npm|pnpm|yarn|node|python|python3|pip|uv|cargo|go|java|docker|kubectl|ssh|scp|ls|dir|cd|pwd|cat|type|echo|grep|rg|find|ps|kill|tasklist|taskkill|netstat|ss|lsof|curl|wget|ping|tracert|ipconfig|ifconfig|systemctl|service|journalctl|make|cmake|pytest|uvicorn|bash|sh|pwsh|powershell|cmd)$/;
+const CHAT_PATTERNS = [
+  /^(你好|您好|嗨|哈喽|在吗)\s*[!.。！？?]*$/i,
+  /^(hi|hello|hey)\s*[!.。！？?]*$/i,
+  /^(谢谢|谢了|thanks|thank you)\s*[!.。！？?]*$/i,
+  /^(你是谁|你是做什么的|who are you)\s*[!.。！？?]*$/i,
+];
+const PLAN_PATTERNS = [
+  /(排查|修复|执行计划|计划|步骤|方案|runbook|checklist)/i,
+  /(帮我|给我|请你).*(排查|修复|处理|解决|配置|安装|梳理|生成)/i,
+  /(怎么|如何).*(修复|排查|处理|解决)/i,
+];
+
+function isLikelyCommand(text) {
+  const value = String(text || '').trim();
+  if (!value) return false;
+  if (/[\u4e00-\u9fff]/.test(value) && !/[|><=&]/.test(value)) return false;
+  const first = value.split(/\s+/)[0].toLowerCase();
+  if (SHELL_COMMAND_PREFIX_RE.test(first)) return true;
+  if (/[|><=&]/.test(value)) return true;
+  if (/^(\.\/|\.\.\/|~\/|\/)/.test(value)) return true;
+  return false;
+}
+
 function isLikelyNaturalLanguage(text) {
   const value = String(text || '').trim();
   if (!value) return false;
   if (/[\u4e00-\u9fff]/.test(value)) return true;
   const first = value.split(/\s+/)[0].toLowerCase();
-  if (/^(git|npm|pnpm|yarn|node|python|python3|pip|uv|cargo|go|java|docker|kubectl|ssh|scp|ls|dir|cd|pwd|cat|type|echo|grep|rg|find|ps|kill|tasklist|taskkill|netstat|ss|lsof|curl|wget|ping|tracert|ipconfig|ifconfig|systemctl|service|journalctl|make|cmake|pytest|uvicorn|bash|sh|pwsh|powershell|cmd)$/.test(first)) {
+  if (SHELL_COMMAND_PREFIX_RE.test(first)) {
     return false;
   }
   if (/\?$/.test(value)) return true;
   if (value.split(/\s+/).length >= 5 && !/[|><=&]/.test(value)) return true;
   return false;
+}
+
+function classifyInputIntent(text) {
+  const value = String(text || '').trim();
+  if (!value) return { kind: 'empty', confidence: 1, reason: 'empty_input', missing: [] };
+  if (isLikelyCommand(value)) return { kind: 'command', confidence: 0.95, reason: 'command_shape', missing: [] };
+  if (CHAT_PATTERNS.some((pattern) => pattern.test(value))) return { kind: 'chat', confidence: 0.95, reason: 'chat_pattern', missing: [] };
+  if (PLAN_PATTERNS.some((pattern) => pattern.test(value))) return { kind: 'plan', confidence: 0.85, reason: 'plan_pattern', missing: [] };
+  if (isLikelyNaturalLanguage(value)) return { kind: 'clarify', confidence: 0.7, reason: 'natural_language_needs_clarify', missing: ['goal'] };
+  return { kind: 'command', confidence: 0.6, reason: 'fallback_command', missing: [] };
+}
+
+function writeAssistantLines(lines, color = '\x1b[36m') {
+  const items = Array.isArray(lines) ? lines : [lines];
+  for (const line of items) {
+    if (!line) continue;
+    writePlanTerminalLine(`[AI] ${line}`, color);
+  }
+}
+
+function handleChatIntent(intent) {
+  const value = String(intent || '').trim();
+  clearSuggestions();
+  renderSteps([]);
+  const replies = /^(谢谢|谢了|thanks|thank you)/i.test(value)
+    ? ['收到。继续输入命令或问题即可。']
+    : /^(你是谁|你是做什么的|who are you)/i.test(value)
+      ? ['我是终端助手。你可以直接输入命令，或描述你要排查的问题。']
+      : ['你好。直接输入命令，或描述你要处理的问题。'];
+  writeAssistantLines(replies);
+  setStatusReady();
+}
+
+function buildClarifyReply(intent) {
+  const value = String(intent || '').trim();
+  if (/docker/i.test(value)) {
+    return [
+      '我理解你是在处理 Docker 相关问题。',
+      '你是想查启动失败原因、查看日志，还是直接给出排查步骤？',
+      '也可以直接说“帮我排查 docker 起不来并给步骤”。',
+    ];
+  }
+  if (/(8000|端口|port)/i.test(value)) {
+    return [
+      '我理解你是在处理端口问题。',
+      '你是想查谁占用了端口、为什么监听失败，还是想直接释放端口？',
+      '也可以直接说“帮我排查 8000 端口占用并给步骤”。',
+    ];
+  }
+  return [
+    `我理解你想处理：${value}`,
+    '现在还缺少一个关键目标：你希望我解释原因、给命令，还是直接生成排查步骤？',
+    '你也可以补一句更明确的话，例如“帮我排查并给步骤”。',
+  ];
+}
+
+function handleClarifyIntent(intent) {
+  clearSuggestions();
+  renderSteps([]);
+  writeAssistantLines(buildClarifyReply(intent));
+  setStatusReady();
 }
 
 async function streamSuggestionsForIntent(intent, extraPayload = {}) {
@@ -1215,6 +1451,19 @@ async function streamSuggestionsForIntent(intent, extraPayload = {}) {
           updateAgentProgress(payload.agent, 'running', `调用工具 ${payload.tool}`);
         } else if (payload.type === 'suggestions') {
           finalPayload = payload;
+          if (payload && payload.session_id) setSessionId(payload.session_id);
+          renderSteps(payload.steps || []);
+          renderLiveSuggestions(payload.suggestions || []);
+        } else if (payload.type === 'alignment_update') {
+          if (applyAlignmentUpdate(payload)) {
+            renderLiveSuggestions(lastSuggestionsCache);
+            finalPayload = syncFinalSuggestionPayload(finalPayload);
+          }
+        } else if (payload.type === 'agent_enhancement') {
+          if (applyAgentEnhancement(payload)) {
+            renderLiveSuggestions(lastSuggestionsCache);
+            finalPayload = syncFinalSuggestionPayload(finalPayload);
+          }
         } else if (payload.type === 'error') {
           throw new Error(payload.message || 'suggest_stream_failed');
         }
@@ -1229,7 +1478,7 @@ async function streamSuggestionsForIntent(intent, extraPayload = {}) {
       handleChunk(value);
     }
     currentSuggestStream = null;
-    return finalPayload || { suggestions: [], steps: [] };
+    return syncFinalSuggestionPayload(finalPayload) || { suggestions: [], steps: [] };
   } catch (err) {
     currentSuggestStream = null;
     throw err;
@@ -1241,6 +1490,8 @@ async function generateExecutionPlan(intent, suggestions) {
   if (result && result.session_id) setSessionId(result.session_id);
   renderPlan(result.plan, intent);
   renderAuditReport(null);
+  const _oldPreAuditCard = document.getElementById('planPreAuditCard');
+  if (_oldPreAuditCard) _oldPreAuditCard.remove();
   switchSidePanel('plan');
   return result.plan;
 }
@@ -1276,11 +1527,11 @@ async function approveAllPlanNodes() {
   writePlanTerminalLine('[PLAN] 已记录全部批准，后续待审批节点会自动放行。', '\x1b[36m');
 }
 
-async function startIntentIteration(intent, { autoExecute = false } = {}) {
+async function startIntentIteration(intent, { autoExecute = false, generatePlan = true, streamPayload = {} } = {}) {
   const normalized = String(intent || '').trim();
   if (!normalized) return;
   try {
-    const sug = await streamSuggestionsForIntent(normalized);
+    const sug = await streamSuggestionsForIntent(normalized, streamPayload);
     if (sug && sug.session_id) setSessionId(sug.session_id);
     renderSteps(sug.steps || []);
     renderSuggestions(
@@ -1306,8 +1557,13 @@ async function startIntentIteration(intent, { autoExecute = false } = {}) {
         await dispatchTerminalCommand(s.command, false);
       }
     );
-    await generateExecutionPlan(normalized, sug.suggestions || []);
-    // Natural-language intents should stop at plan generation.
+    if (generatePlan) {
+      try {
+        await generateExecutionPlan(normalized, sug.suggestions || []);
+      } catch (planErr) {
+        writeInfoAbovePrompt(`执行计划生成失败，已保留建议列表：${String(planErr.message || planErr)}`);
+      }
+    }
     // Actual execution must be a separate user action from the plan panel.
     void autoExecute;
     setStatusReady();
@@ -1805,7 +2061,7 @@ async function apiRunbooksDelete(filename) {
 }
 
 async function runSuggestOnly(text) {
-  await startIntentIteration(text, { autoExecute: false });
+  await startIntentIteration(text, { autoExecute: false, generatePlan: false });
   prompt();
 }
 
@@ -2092,6 +2348,115 @@ function confidenceBadge(suggestion) {
   return `<span class="badge confidence-${escapeHtml(level)}">${escapeHtml(label)}</span>`;
 }
 
+function alignmentBadge(suggestion) {
+  const level = String((suggestion && suggestion.alignment) || '').trim().toLowerCase();
+  if (!level) return '';
+  const labels = {
+    ok: 'aligned',
+    warn: 'check',
+    mismatch: 'mismatch',
+  };
+  return `<span class="badge alignment-${escapeHtml(level)}">${escapeHtml(labels[level] || level)}</span>`;
+}
+
+function alignmentSummary(suggestion) {
+  const level = String((suggestion && suggestion.alignment) || '').trim().toLowerCase();
+  if (!level) return '';
+  const reason = String((suggestion && suggestion.alignment_reason) || '').trim();
+  const label = level === 'ok' ? 'Aligned' : level === 'warn' ? 'Alignment Check' : 'Mismatch';
+  return reason ? `${label}: ${reason}` : label;
+}
+
+function insertSuggestionCommand(suggestion) {
+  if (!suggestion || suggestion.command === '(auto)') return;
+  insertTextAtCursor(suggestion.command);
+}
+
+async function executeSuggestion(suggestion) {
+  if (!suggestion || suggestion.command === '(auto)') return;
+  if (MODE.get() !== 'assist') {
+    writeInfo('当前是「只建议」模式，切换到「建议+执行」即可一键执行。');
+    return;
+  }
+  if (suggestion.risk_level === 'block') {
+    writeError('该命令被安全策略拦截（block）。');
+    return;
+  }
+  if (suggestion.requires_confirmation) {
+    setPendingConfirmation(
+      suggestion.command,
+      '风险等级为 warn，建议确认后再执行。'
+    );
+    writeInfoAbovePrompt('该建议需要确认：请在右侧点击「确认执行」。');
+    return;
+  }
+  await dispatchTerminalCommand(suggestion.command, false);
+}
+
+function cloneSuggestionsForPayload(items) {
+  if (!Array.isArray(items)) return [];
+  return items.map((item) => ({
+    ...item,
+    citations: Array.isArray(item && item.citations)
+      ? item.citations.map((citation) => ({ ...citation }))
+      : [],
+  }));
+}
+
+function renderLiveSuggestions(suggestions) {
+  renderSuggestions(suggestions || [], insertSuggestionCommand, executeSuggestion);
+}
+
+function syncFinalSuggestionPayload(finalPayload) {
+  if (!finalPayload) return finalPayload;
+  return {
+    ...finalPayload,
+    suggestions: cloneSuggestionsForPayload(lastSuggestionsCache),
+  };
+}
+
+function updateSuggestionCache(suggestionId, updater) {
+  const id = String(suggestionId || '').trim();
+  if (!id || !Array.isArray(lastSuggestionsCache) || !lastSuggestionsCache.length) return false;
+  let changed = false;
+  lastSuggestionsCache = lastSuggestionsCache.map((item) => {
+    if (!item || String(item.id || '') !== id) return item;
+    const next = updater({ ...item, citations: Array.isArray(item.citations) ? item.citations.map((citation) => ({ ...citation })) : [] });
+    changed = true;
+    return next;
+  });
+  return changed;
+}
+
+function applyAlignmentUpdate(payload) {
+  if (!payload) return false;
+  return updateSuggestionCache(payload.suggestion_id, (item) => ({
+    ...item,
+    alignment: String(payload.alignment || '').trim(),
+    alignment_reason: String(payload.alignment_reason || '').trim(),
+  }));
+}
+
+function applyAgentEnhancement(payload) {
+  if (!payload) return false;
+  return updateSuggestionCache(payload.suggestion_id, (item) => {
+    const existing = Array.isArray(item.citations) ? item.citations.map((citation) => ({ ...citation })) : [];
+    const seen = new Set(existing.map((citation) => `${citation.title || ''}::${citation.snippet || ''}::${citation.source || ''}`));
+    for (const citation of Array.isArray(payload.citations) ? payload.citations : []) {
+      const key = `${citation && citation.title ? citation.title : ''}::${citation && citation.snippet ? citation.snippet : ''}::${citation && citation.source ? citation.source : ''}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      existing.push({ ...citation });
+    }
+    return {
+      ...item,
+      citations: existing,
+      confidence: String(payload.confidence || item.confidence || ''),
+      confidence_label: String(payload.confidence_label || item.confidence_label || ''),
+    };
+  });
+}
+
 function renderSuggestions(suggestions, insertFn, executeFn) {
   clearSuggestions();
   lastSuggestionsCache = Array.isArray(suggestions) ? suggestions : [];
@@ -2116,12 +2481,13 @@ function renderSuggestions(suggestions, insertFn, executeFn) {
 
     const card = document.createElement('div');
     card.className = 'card';
+    card.dataset.suggestionId = String(s.id || '');
 
     const title = document.createElement('div');
     title.className = 'card-title';
     const confirmTag = s.requires_confirmation ? ' · 需确认' : '';
     const agentTag = s.agent ? ` 路 ${escapeHtml(s.agent)}` : '';
-    title.innerHTML = `<span>${escapeHtml(s.title)}${agentTag}${confirmTag}</span><span class="badge-row"><span class="badge ${badgeClass(s.risk_level)}">${escapeHtml(s.risk_level)}</span>${confidenceBadge(s)}</span>`;
+    title.innerHTML = `<span>${escapeHtml(s.title)}${agentTag}${confirmTag}</span><span class="badge-row"><span class="badge ${badgeClass(s.risk_level)}">${escapeHtml(s.risk_level)}</span>${confidenceBadge(s)}${alignmentBadge(s)}</span>`;
 
     const cmd = document.createElement('div');
     cmd.className = 'cmd';
@@ -2164,6 +2530,7 @@ function renderSuggestions(suggestions, insertFn, executeFn) {
       addExplainLine('Risk', s.risk);
       addExplainLine('Rollback', s.rollback);
       addExplainLine('Verify', s.verify);
+      addExplainLine('Alignment', alignmentSummary(s));
 
       if (Array.isArray(s.citations) && s.citations.length > 0) {
         for (const c of s.citations.slice(0, 3)) {
@@ -2211,24 +2578,19 @@ try {
     fitAddon = new FitAddon.FitAddon();
     term.loadAddon(fitAddon);
     fitAddon.fit();
-    window.addEventListener('resize', () => {
-      try {
-        fitAddon.fit();
-      } catch {
-        // ignore
-      }
-    });
   }
 } catch {
   // ignore
 }
-window.addEventListener('resize', () => {
-  try {
-    planRenderer.fit();
-  } catch {
-    // ignore
-  }
-});
+window.addEventListener('resize', refreshResponsiveLayout);
+if (typeof ResizeObserver !== 'undefined') {
+  const responsiveObserver = new ResizeObserver(() => {
+    refreshResponsiveLayout();
+  });
+  if (topbarEl) responsiveObserver.observe(topbarEl);
+  if (layoutEl) responsiveObserver.observe(layoutEl);
+  if (onboardingEl) responsiveObserver.observe(onboardingEl);
+}
 
 let currentLine = '';
 let cursorPos = 0;
@@ -2735,6 +3097,7 @@ renderAgentPanel();
 planRenderer.clear();
 renderAuditReport(null);
 if (onboardingEl) onboardingEl.classList.remove('hidden');
+refreshResponsiveLayout();
 
 async function refreshRunbookList() {
   if (!runbookListEl) return;
@@ -2922,17 +3285,32 @@ for (const btn of demoBtnEls) {
     const key = String(btn.getAttribute('data-demo') || '').trim();
     if (key === 'custom') {
       if (onboardingEl) onboardingEl.classList.add('hidden');
+      refreshResponsiveLayout();
       writeInfoAbovePrompt('请输入自然语言问题后回车，系统会生成执行计划。');
       return;
     }
     const intent = DEMO_INTENTS[key];
     if (!intent) return;
     if (onboardingEl) onboardingEl.classList.add('hidden');
+    refreshResponsiveLayout();
+    await ensureDemoContext(key);
     echoIntentToTerminal(intent);
-    await startIntentIteration(intent, { autoExecute: false });
+    await startIntentIteration(intent, {
+      autoExecute: false,
+      streamPayload: {
+        extra: {
+          demo_key: key,
+        },
+      },
+    });
   });
 }
-if (onboardingCloseEl) onboardingCloseEl.addEventListener('click', () => onboardingEl && onboardingEl.classList.add('hidden'));
+if (onboardingCloseEl) {
+  onboardingCloseEl.addEventListener('click', () => {
+    if (onboardingEl) onboardingEl.classList.add('hidden');
+    refreshResponsiveLayout();
+  });
+}
 
 if (runbooksBtn) runbooksBtn.addEventListener('click', () => openRunbookModal());
 if (runbookCloseEl) runbookCloseEl.addEventListener('click', () => closeRunbookModal());
@@ -3323,12 +3701,19 @@ async function handlePlanModeInput(data) {
       await runSuggestOnly(cmd.slice(1).trim());
       return;
     }
-    if (isLikelyNaturalLanguage(cmd)) {
+    const intent = classifyInputIntent(cmd);
+    if (intent.kind !== 'command') {
       pushHistory(cmd);
       term.write('\r\n');
       currentLine = '';
       cursorPos = 0;
-      await startIntentIteration(cmd, { autoExecute: false });
+      if (intent.kind === 'chat') {
+        handleChatIntent(cmd);
+      } else if (intent.kind === 'clarify') {
+        handleClarifyIntent(cmd);
+      } else {
+        await startIntentIteration(cmd, { autoExecute: false, generatePlan: true });
+      }
       prompt();
       return;
     }
@@ -3409,6 +3794,8 @@ if (executorSwitchEl) {
   try {
     const h = await apiHealth();
     ptySupported = String(h.pty_supported || '0') === '1';
+    demoLocalRoot = String(h.local_root || '').trim();
+    demoWorkspaceAvailable = String(h.demo_workspace_available || '0') === '1';
     applyTerminalModeUi();
 
     // Hosted Spaces: avoid persisting token/session across refresh by default.
@@ -3423,11 +3810,11 @@ if (executorSwitchEl) {
     const m = st ? (st.mode || st.current_mode) : '';
     if (m) {
       currentExecutorMode = String(m);
-      await setTerminalMode(ptySupported ? 'pty' : 'plan');
+      await setTerminalMode('plan');
       return;
     }
     if (h && h.executor) currentExecutorMode = String(h.executor);
-    await setTerminalMode(ptySupported ? 'pty' : 'plan');
+    await setTerminalMode('plan');
   } catch {
     statusEl.textContent = '后端未连接';
   }
@@ -3489,5 +3876,4 @@ if (exportBtn) {
     }
   });
 }
-
 

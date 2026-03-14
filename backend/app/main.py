@@ -5,6 +5,7 @@ import os
 import time
 import hashlib
 import platform as _platform
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 import shlex
@@ -47,7 +48,14 @@ from .models import (
     SuggestRequest,
     SuggestResponse,
 )
-from .llm.modelscope_client import PROVIDERS, normalize_provider, resolve_llm_config
+from .llm.modelscope_client import (
+    PROVIDERS,
+    normalize_chat_temperature,
+    normalize_provider,
+    resolve_llm_config,
+    urlopen_without_proxy,
+)
+from .demo_cache import load_demo_suggestions, save_demo_suggestions
 from .local_secrets import (
     write_llm_base_url,
     write_llm_model,
@@ -98,6 +106,7 @@ logger = logging.getLogger("terminal_copilot")
 _PLAN_STORE: dict[str, ExecutionPlan] = {}
 RUNBOOK_DIR = REPO_ROOT / "docs" / "runbook"
 CUSTOM_RUNBOOK_DIR = RUNBOOK_DIR / "custom"
+_ENHANCE_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="suggest-enhance")
 
 _STARTED_AT_TS = time.time()
 
@@ -176,11 +185,208 @@ def _llm_token_configured() -> bool:
     return resolve_llm_config(require_token=True) is not None
 
 
+def _llm_enabled() -> bool:
+    enabled_flag = os.getenv("TERMINAL_COPILOT_LLM_ENABLED", "auto").strip().lower()
+    if enabled_flag == "auto":
+        return _llm_token_configured()
+    return enabled_flag in {"1", "true", "yes", "on"}
+
+
 def _clip_for_log(text: str, limit: int = 200) -> str:
     s = (text or "").replace("\n", "\\n").replace("\r", "\\r").strip()
     if len(s) <= limit:
         return s
     return s[:limit] + "...(truncated)"
+
+
+def _demo_cache_meta(req: SuggestRequest) -> dict[str, str] | None:
+    extra = req.extra or {}
+    demo_key = str(extra.get("demo_key") or "").strip().lower()
+    if not demo_key:
+        return None
+    cfg = resolve_llm_config(require_token=False)
+    return {
+        "build_id": _runtime_build_id(),
+        "demo_key": demo_key,
+        "intent": (req.last_command or "").strip(),
+        "platform": (req.platform or "").strip(),
+        "provider": cfg.provider if cfg else "",
+        "model": cfg.model if cfg else "",
+    }
+
+
+def _load_demo_cached_suggestions(req: SuggestRequest) -> list[CommandSuggestion] | None:
+    meta = _demo_cache_meta(req)
+    if not meta:
+        return None
+    try:
+        cached = load_demo_suggestions(**meta)
+        if cached:
+            logger.info(
+                "demo_cache_hit demo=%s intent=%s count=%s",
+                meta["demo_key"],
+                _clip_for_log(meta["intent"], 120),
+                len(cached),
+            )
+        return cached
+    except Exception as exc:
+        logger.warning("demo_cache_load_failed demo=%s err=%s", meta["demo_key"], exc)
+        return None
+
+
+def _save_demo_cached_suggestions(
+    req: SuggestRequest, suggestions: list[CommandSuggestion]
+) -> None:
+    meta = _demo_cache_meta(req)
+    if not meta or not suggestions:
+        return
+    try:
+        save_demo_suggestions(suggestions=suggestions, **meta)
+        logger.info(
+            "demo_cache_saved demo=%s intent=%s count=%s",
+            meta["demo_key"],
+            _clip_for_log(meta["intent"], 120),
+            len(suggestions),
+        )
+    except Exception as exc:
+        logger.warning("demo_cache_save_failed demo=%s err=%s", meta["demo_key"], exc)
+
+
+def _apply_policy_hints(suggestions: list[CommandSuggestion]) -> None:
+    for suggestion in suggestions:
+        if not suggestion.command or suggestion.command == "(auto)":
+            continue
+        decision = evaluate(suggestion.command)
+        if decision.level == "block":
+            suggestion.risk_level = RiskLevel.block
+            suggestion.requires_confirmation = False
+            suggestion.explanation = (
+                f"{suggestion.explanation}\nSafety notice: {decision.reason}"
+            ).strip()
+        elif decision.level == "warn":
+            suggestion.risk_level = RiskLevel.warn
+            suggestion.requires_confirmation = True
+            suggestion.explanation = (
+                f"{suggestion.explanation}\nSafety notice: {decision.reason}"
+            ).strip()
+
+
+def _run_suggestion_enhancement(
+    intent: str,
+    suggestions: list[CommandSuggestion],
+    event_queue: Queue,
+) -> None:
+    from .agents.rag_agent import RAGAgent
+    from .grounding import async_alignment_check
+
+    rag_agent = RAGAgent()
+    updated = [item.model_copy(deep=True) for item in suggestions]
+    event_queue.put(
+        {
+            "type": "agent_progress",
+            "agent": "rag",
+            "status": "start",
+            "message": "Enhancing citations for rule suggestions...",
+        }
+    )
+    event_queue.put(
+        {
+            "type": "agent_progress",
+            "agent": "safety",
+            "status": "start",
+            "message": "Checking semantic alignment...",
+        }
+    )
+
+    pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="suggest-augment")
+    rag_future = pool.submit(rag_agent.retrieve, intent, 3)
+    align_future = pool.submit(async_alignment_check, intent, updated)
+    try:
+        try:
+            citations = list(rag_future.result(timeout=10) or [])
+            event_queue.put(
+                {
+                    "type": "agent_progress",
+                    "agent": "rag",
+                    "status": "done",
+                    "message": f"Retrieved {len(citations)} extra citation(s).",
+                }
+            )
+        except Exception:
+            citations = []
+            event_queue.put(
+                {
+                    "type": "agent_progress",
+                    "agent": "rag",
+                    "status": "error",
+                    "message": "Citation enhancement unavailable.",
+                }
+            )
+
+        try:
+            updated = list(align_future.result(timeout=10) or updated)
+            matched = sum(1 for item in updated if item.alignment)
+            event_queue.put(
+                {
+                    "type": "agent_progress",
+                    "agent": "safety",
+                    "status": "done",
+                    "message": f"Alignment checked for {matched} suggestion(s).",
+                }
+            )
+        except Exception:
+            event_queue.put(
+                {
+                    "type": "agent_progress",
+                    "agent": "safety",
+                    "status": "error",
+                    "message": "Alignment check unavailable.",
+                }
+            )
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    for suggestion in updated:
+        if not suggestion.alignment:
+            continue
+        event_queue.put(
+            {
+                "type": "alignment_update",
+                "suggestion_id": suggestion.id,
+                "alignment": suggestion.alignment,
+                "alignment_reason": suggestion.alignment_reason,
+            }
+        )
+
+    for suggestion in suggestions:
+        existing = {
+            (citation.title, citation.snippet, citation.source)
+            for citation in (suggestion.citations or [])
+        }
+        extra = []
+        for citation in citations:
+            key = (
+                getattr(citation, "title", ""),
+                getattr(citation, "snippet", ""),
+                getattr(citation, "source", ""),
+            )
+            if key in existing:
+                continue
+            existing.add(key)
+            extra.append(citation)
+            if len(extra) >= 2:
+                break
+        if not extra:
+            continue
+        event_queue.put(
+            {
+                "type": "agent_enhancement",
+                "suggestion_id": suggestion.id,
+                "citations": [citation.model_dump() for citation in extra],
+                "confidence": suggestion.confidence,
+                "confidence_label": suggestion.confidence_label,
+            }
+        )
 
 
 def _refresh_knowledge_caches() -> None:
@@ -339,11 +545,15 @@ def _persist_client_state() -> bool:
 @app.get("/api/health")
 def health() -> dict[str, str]:
     ex = get_executor()
+    local_root = Path(os.getenv("TERMINAL_COPILOT_LOCAL_ROOT", str(REPO_ROOT))).resolve()
+    demo_workspace = local_root / "workspace"
     return {
         "status": "ok",
         "executor": ex.name,
         "persist_client_state": "1" if _persist_client_state() else "0",
         "pty_supported": "1" if pty_supported() else "0",
+        "local_root": str(local_root),
+        "demo_workspace_available": "1" if demo_workspace.is_dir() else "0",
     }
 
 
@@ -489,6 +699,7 @@ def api_suggest(req: SuggestRequest) -> SuggestResponse:
         req.platform = server_platform  # type: ignore[assignment]
 
     suggestions = suggest(req)
+    _apply_policy_hints(suggestions)
 
     # Observability: record whether LLM suggestions are present / error fallback happened
     if any(("llm" in (s.tags or [])) for s in suggestions):
@@ -501,19 +712,6 @@ def api_suggest(req: SuggestRequest) -> SuggestResponse:
             },
         )
 
-    # Apply policy hints to suggestions (consistent with execute-time guard)
-    for s in suggestions:
-        if not s.command or s.command == "(auto)":
-            continue
-        d = evaluate(s.command)
-        if d.level == "block":
-            s.risk_level = RiskLevel.block
-            s.requires_confirmation = False
-            s.explanation = f"{s.explanation}\n安全提示：{d.reason}"
-        elif d.level == "warn":
-            s.risk_level = RiskLevel.warn
-            s.requires_confirmation = True
-            s.explanation = f"{s.explanation}\n安全提示：{d.reason}"
     STORE.add_event(
         session,
         kind="suggest",
@@ -553,24 +751,30 @@ def api_plan_generate(req: PlanGenerateRequest) -> PlanGenerateResponse:
     if req.platform != server_platform:
         req.platform = server_platform  # type: ignore[assignment]
 
-    suggestions: list[CommandSuggestion]
-    if req.suggestions:
-        suggestions = req.suggestions
-    else:
-        suggest_req = SuggestRequest(
-            session_id=session.id,
-            last_command=req.intent,
-            last_exit_code=None,
-            last_stdout="",
-            last_stderr="",
-            platform=req.platform,
-            extra={},
-        )
-        suggestions = suggest(suggest_req)
+    from .agents.executor_agent import ExecutorAgent
+    from .agents.safety_agent import SafetyAgent
 
-    plan: ExecutionPlan = build_execution_plan(
-        intent=req.intent, suggestions=suggestions
-    )
+    executor_agent = ExecutorAgent()
+    safety_agent = SafetyAgent()
+
+    if req.suggestions:
+        plan = build_execution_plan(intent=req.intent, suggestions=req.suggestions)
+    elif req.intent and _llm_enabled():
+        try:
+            plan = executor_agent.generate_dag(req.intent, platform=req.platform)
+        except Exception as exc:
+            logger.warning(
+                "api_plan_generate llm_fallback intent=%s err=%s",
+                _clip_for_log(req.intent or "", 160),
+                _clip_for_log(str(exc), 200),
+            )
+            plan = None
+        if plan is None:
+            plan = build_execution_plan(intent=req.intent, suggestions=[])
+    else:
+        plan = build_execution_plan(intent=req.intent, suggestions=[])
+
+    plan.pre_audit = safety_agent.pre_audit(plan, timeout=8.0)
     _PLAN_STORE[plan.id] = plan
     STORE.add_event(
         session,
@@ -611,28 +815,74 @@ async def api_suggest_stream(req: SuggestRequest) -> StreamingResponse:
             pass
         req.platform = server_platform  # type: ignore[assignment]
 
+    session = STORE.get_or_create(req.session_id)
     q: Queue = Queue()
     loop = asyncio.get_event_loop()
+    llm_enabled = _llm_enabled()
 
     def _run_orchestrator() -> None:
         """鍦ㄧ嚎绋嬩腑杩愯 Multi-Agent锛屼簨浠舵帹閫佸埌闃熷垪"""
         try:
-            # 鍏堝皾璇曡鍒欏紩鎿?
-            rule_suggestions = suggest(req)
-            # 濡傛灉瑙勫垯寮曟搸宸叉湁缁撴灉锛堥潪 orchestrator 鏉ユ簮锛夛紝鐩存帴鎺ㄩ€?
-            if rule_suggestions and not any(
-                "orchestrator" in (s.tags or []) for s in rule_suggestions
-            ):
-                q.put({"type": "rule_suggestions"})
-                # 浠嶇劧鎺ㄩ€?agent 鍗忎綔缁撴灉鐢ㄤ簬鍙鍖?
+            cached_demo_suggestions = _load_demo_cached_suggestions(req)
+            if cached_demo_suggestions:
+                q.put(
+                    {
+                        "type": "agent_progress",
+                        "agent": "orchestrator",
+                        "status": "done",
+                        "message": "Demo cache hit. Reusing the last successful LLM result.",
+                    }
+                )
+                q.put(
+                    {
+                        "type": "suggestions",
+                        "session_id": str(session.id),
+                        "suggestions": [
+                            s.model_dump() for s in cached_demo_suggestions
+                        ],
+                        "steps": STORE.to_dict_steps(session),
+                    }
+                )
+                return
 
-            # 璋冪敤 OrchestratorAgent锛堝甫浜嬩欢闃熷垪锛?
-            from .agents import OrchestratorAgent
-            from .llm.modelscope_client import modelscope_is_configured
+            rule_suggestions = suggest(req, allow_orchestrator=False)
+            _apply_policy_hints(rule_suggestions)
 
-            if modelscope_is_configured():
+            if rule_suggestions:
+                q.put(
+                    {
+                        "type": "agent_progress",
+                        "agent": "orchestrator",
+                        "status": "done",
+                        "message": "Rule suggestions returned immediately.",
+                    }
+                )
+                q.put(
+                    {
+                        "type": "suggestions",
+                        "session_id": str(session.id),
+                        "suggestions": [s.model_dump() for s in rule_suggestions],
+                        "steps": STORE.to_dict_steps(session),
+                    }
+                )
+                if llm_enabled:
+                    future = _ENHANCE_POOL.submit(
+                        _run_suggestion_enhancement,
+                        req.last_command,
+                        [s.model_copy(deep=True) for s in rule_suggestions],
+                        q,
+                    )
+                    try:
+                        future.result(timeout=22.0)
+                    except Exception:
+                        pass
+                return
+
+            if llm_enabled:
+                from .agents import OrchestratorAgent
+
                 orchestrator = OrchestratorAgent()
-                agent_suggestions = orchestrator.process(
+                final = orchestrator.process(
                     user_intent=req.last_command,
                     platform=req.platform,
                     last_stdout=req.last_stdout,
@@ -641,34 +891,34 @@ async def api_suggest_stream(req: SuggestRequest) -> StreamingResponse:
                     event_queue=q,
                     conversation_messages=req.conversation_messages,
                 )
-                final = agent_suggestions if agent_suggestions else rule_suggestions
+                _apply_policy_hints(final)
+                _save_demo_cached_suggestions(req, final)
             else:
-                # 鏃?LLM token锛屽彧鍙戜竴鏉?orchestrator 鐘舵€佺劧鍚庣敤瑙勫垯缁撴灉
                 q.put(
                     {
                         "type": "agent_progress",
                         "agent": "orchestrator",
                         "status": "done",
-                        "message": "规则引擎模式（未配置 LLM Token）",
+                        "message": "No rule suggestions and LLM is unavailable.",
                     }
                 )
-                final = rule_suggestions
+                final = []
 
-            session = STORE.get_or_create(req.session_id)
-            from .grounding import annotate_confidence
-
-            annotate_confidence(final)
-            suggestions_data = [s.model_dump() for s in final]
-            steps_data = STORE.to_dict_steps(session)
             q.put(
                 {
                     "type": "suggestions",
                     "session_id": str(session.id),
-                    "suggestions": suggestions_data,
-                    "steps": steps_data,
+                    "suggestions": [s.model_dump() for s in final],
+                    "steps": STORE.to_dict_steps(session),
                 }
             )
+            return
         except Exception as e:
+            logger.exception(
+                "api_suggest_stream failed session=%s last=%s",
+                req.session_id,
+                _clip_for_log(req.last_command or "", 160),
+            )
             q.put({"type": "error", "message": str(e)[:200]})
         finally:
             q.put(None)  # 缁撴潫鍝ㄥ叺
@@ -849,13 +1099,19 @@ def api_llm_test(req: LlmTestRequest) -> LlmTestResponse:
     start = time.perf_counter()
     try:
         url = base_url + "chat/completions"
+        temperature = normalize_chat_temperature(
+            provider=provider,
+            base_url=base_url,
+            model=model,
+            temperature=0.0,
+        )
         payload = {
             "model": model,
             "messages": [
                 {"role": "system", "content": "You are a helpful assistant."},
                 {"role": "user", "content": prompt},
             ],
-            "temperature": 0.0,
+            "temperature": temperature,
             "max_tokens": 16,
             "stream": False,
         }
@@ -871,7 +1127,7 @@ def api_llm_test(req: LlmTestRequest) -> LlmTestResponse:
         )
 
         try:
-            with urllib.request.urlopen(
+            with urlopen_without_proxy(
                 http_req, timeout=(cfg.timeout_seconds if cfg else 20.0)
             ) as resp:
                 body = resp.read().decode("utf-8")
