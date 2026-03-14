@@ -408,8 +408,12 @@ function switchSidePanel(name) {
   }
 }
 
+let _rafLayoutPending = false;
 function refreshResponsiveLayout() {
+  if (_rafLayoutPending) return;
+  _rafLayoutPending = true;
   requestAnimationFrame(() => {
+    _rafLayoutPending = false;
     try {
       if (fitAddon) fitAddon.fit();
     } catch {
@@ -2587,8 +2591,10 @@ if (typeof ResizeObserver !== 'undefined') {
   const responsiveObserver = new ResizeObserver(() => {
     refreshResponsiveLayout();
   });
+  // Observe topbar and onboarding only — NOT layoutEl, because fitAddon.fit()
+  // changes the terminal height which propagates to layoutEl, creating an
+  // infinite resize feedback loop that causes flickering on mobile.
   if (topbarEl) responsiveObserver.observe(topbarEl);
-  if (layoutEl) responsiveObserver.observe(layoutEl);
   if (onboardingEl) responsiveObserver.observe(onboardingEl);
 }
 

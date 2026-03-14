@@ -1467,6 +1467,14 @@ button.danger {
     min-height: auto;
   }
 
+  /* Fixed height on mobile so fitAddon.fit() has a stable measurement target
+     and does not create a resize feedback loop. */
+  .terminal {
+    height: 45dvh;
+    min-height: 200px;
+    flex: none;
+  }
+
   .terminal-toolbar {
     flex-direction: column;
     align-items: stretch;
