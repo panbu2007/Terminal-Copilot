@@ -8,6 +8,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+& "$env:WINDIR\System32\OpenSSH\scp.exe" -o BatchMode=yes -o StrictHostKeyChecking=no `
+  "scripts/setup_terminal_privilege_mode.sh" "${HostName}:${AppDir}/scripts/setup_terminal_privilege_mode.sh"
+
 $remoteScript = @"
 set -euo pipefail
 cd "$AppDir"
@@ -21,6 +24,9 @@ fi
 
 source .venv/bin/activate
 pip install -r requirements.txt
+
+chmod +x scripts/setup_terminal_privilege_mode.sh
+./scripts/setup_terminal_privilege_mode.sh "$AppDir" "$Service"
 
 systemctl restart "$Service"
 sleep 3
@@ -39,6 +45,9 @@ echo
 
 echo "--- service ---"
 systemctl --no-pager --full status "$Service" | sed -n '1,40p'
+
+echo "--- pty user ---"
+systemctl show -p Environment "$Service" | sed -n '1,20p'
 "@
 
 Write-Host "[deploy] host=$HostName"

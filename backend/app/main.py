@@ -485,11 +485,15 @@ def _persist_client_state() -> bool:
 @app.get("/api/health")
 def health() -> dict[str, str]:
     ex = get_executor()
+    local_root = Path(os.getenv("TERMINAL_COPILOT_LOCAL_ROOT", str(REPO_ROOT))).resolve()
+    demo_workspace = local_root / "workspace"
     return {
         "status": "ok",
         "executor": ex.name,
         "persist_client_state": "1" if _persist_client_state() else "0",
         "pty_supported": "1" if pty_supported() else "0",
+        "local_root": str(local_root),
+        "demo_workspace_available": "1" if demo_workspace.is_dir() else "0",
     }
 
 

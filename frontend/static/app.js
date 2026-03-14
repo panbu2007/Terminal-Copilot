@@ -77,6 +77,8 @@ let ptyControlSeq = 0;
 
 // cwd prompt
 let currentCwd = '';
+let demoLocalRoot = '';
+let demoWorkspaceAvailable = false;
 
 // Track what prompt prefix is currently rendered on the active input line.
 // Used to compute minimal overwrite lengths without clearing the whole line (reduces flicker).
@@ -276,10 +278,38 @@ function clearTimeline() {
 }
 
 const DEMO_INTENTS = {
-  port: '端口 8000 被占用了怎么办？请生成排查和修复执行计划。',
-  docker: '帮我配置 Docker 国内镜像源，并给出可以验证是否生效的执行计划。',
-  git: '我输入了 git chekcout main，帮我诊断并生成修复执行计划。',
+  health: '对这台服务器做一次全面健康巡检：检查磁盘空间、内存使用、CPU 负载、异常进程，有问题就修复，最后生成巡检报告。',
+  deploy: '刚部署了一个服务，帮我验证它是否正常运行：检查进程是否存活、端口是否监听、健康接口是否响应、依赖是否完整。',
+  security: '对这台服务器做一次安全审查：扫描开放端口、检查可登录用户、查找异常进程、检查 SUID 文件权限，生成安全审计报告。',
 };
+
+function joinDemoPath(base, child) {
+  const root = String(base || '').trim().replace(/[\\/]+$/, '');
+  if (!root) return '';
+  const sep = root.includes('\\') && !root.includes('/') ? '\\' : '/';
+  return `${root}${sep}${child}`;
+}
+
+function quoteCdPath(target) {
+  return `"${String(target || '').replace(/"/g, '\\"')}"`;
+}
+
+function getDemoTargetCwd(key) {
+  if (!demoLocalRoot) return '';
+  if (key === 'deploy' && demoWorkspaceAvailable) return joinDemoPath(demoLocalRoot, 'workspace');
+  if (key === 'health' || key === 'security') return demoLocalRoot;
+  return '';
+}
+
+async function ensureDemoContext(key) {
+  const target = getDemoTargetCwd(key);
+  if (!target || String(currentCwd || '') === target) return;
+  const execRes = await apiExecute(`cd ${quoteCdPath(target)}`, false);
+  if (execRes && typeof execRes.cwd === 'string' && execRes.cwd) {
+    currentCwd = execRes.cwd;
+    refreshPrompt();
+  }
+}
 
 const AGENT_META = [
   { key: 'orchestrator', label: 'Orchestrator', icon: '◎' },
@@ -3216,6 +3246,7 @@ for (const btn of demoBtnEls) {
     const intent = DEMO_INTENTS[key];
     if (!intent) return;
     if (onboardingEl) onboardingEl.classList.add('hidden');
+    await ensureDemoContext(key);
     echoIntentToTerminal(intent);
     await startIntentIteration(intent, { autoExecute: false });
   });
@@ -3704,6 +3735,8 @@ if (executorSwitchEl) {
   try {
     const h = await apiHealth();
     ptySupported = String(h.pty_supported || '0') === '1';
+    demoLocalRoot = String(h.local_root || '').trim();
+    demoWorkspaceAvailable = String(h.demo_workspace_available || '0') === '1';
     applyTerminalModeUi();
 
     // Hosted Spaces: avoid persisting token/session across refresh by default.
@@ -3784,5 +3817,4 @@ if (exportBtn) {
     }
   });
 }
-
 

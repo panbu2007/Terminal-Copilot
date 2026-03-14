@@ -14,7 +14,9 @@ __pycache__/
 .gitignore
 
 # Docs / misc
-docs/
+docs/*
+!docs/runbook/
+!docs/runbook/**
 docker/
 
 # OS

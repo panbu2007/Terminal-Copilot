@@ -316,8 +316,333 @@ def _build_port_in_use_plan(*, intent: str, suggestions: list[CommandSuggestion]
     )
 
 
+# ── Scenario detection helpers ─────────────────────────────────────────────
+
+def _is_health_check_scenario(intent: str) -> bool:
+    low = (intent or "").lower()
+    strong_health_terms = ["巡检", "体检", "health check", "health inspection", "server health", "全面健康"]
+    metric_terms = ["磁盘", "disk", "内存", "memory", "cpu", "负载", "load", "服务器状态"]
+    return any(k in low for k in strong_health_terms) or ("健康" in low and any(k in low for k in metric_terms))
+
+
+def _is_deploy_verify_scenario(intent: str) -> bool:
+    low = (intent or "").lower()
+    deploy_terms = ["部署", "上线", "deploy", "发布"]
+    verify_terms = ["验证", "verify", "运行", "service", "服务", "健康接口", "health", "进程", "process", "端口", "port", "依赖", "dependency", "dependencies"]
+    return any(k in low for k in deploy_terms) and any(k in low for k in verify_terms)
+
+
+def _is_security_audit_scenario(intent: str) -> bool:
+    low = (intent or "").lower()
+    security_terms = ["安全", "审查", "审计", "security", "audit", "漏洞", "合规", "compliance"]
+    target_terms = ["端口", "port", "权限", "permission", "suid", "用户", "user", "users"]
+    return any(k in low for k in security_terms) and any(k in low for k in target_terms)
+
+
+# ── Health Check Plan ──────────────────────────────────────────────────────
+
+def _build_health_check_plan(*, intent: str) -> ExecutionPlan:
+    """服务器健康巡检：磁盘→内存→CPU→进程→条件分支→清理/完成"""
+    cit_disk = retrieve("磁盘空间 df", limit=1)
+    cit_mem = retrieve("内存 free", limit=1)
+    cit_proc = retrieve("进程 ps", limit=1)
+
+    nodes = [
+        PlanNode(
+            id="h0", type="diagnose", title="开始服务器巡检",
+            command="", risk_level=RiskLevel.safe, grounded=False,
+            description=intent or "对服务器进行全面健康检查",
+            citations=[],
+        ),
+        PlanNode(
+            id="h1", type="command", title="检查磁盘空间",
+            command="df -h",
+            risk_level=RiskLevel.safe, grounded=bool(cit_disk),
+            description="查看各分区磁盘使用率，超过 85%% 需关注。",
+            citations=list(cit_disk),
+        ),
+        PlanNode(
+            id="h2", type="command", title="检查内存使用",
+            command="free -h",
+            risk_level=RiskLevel.safe, grounded=bool(cit_mem),
+            description="查看内存和 swap 使用情况。",
+            citations=list(cit_mem),
+        ),
+        PlanNode(
+            id="h3", type="command", title="检查 CPU 负载",
+            command="uptime",
+            risk_level=RiskLevel.safe, grounded=False,
+            description="查看系统负载均值（1/5/15 分钟）。",
+            citations=[],
+        ),
+        PlanNode(
+            id="h4", type="command", title="查看高内存占用进程",
+            command="ps aux --sort=-%mem | head -8",
+            risk_level=RiskLevel.safe, grounded=bool(cit_proc),
+            description="列出内存占用最高的进程，便于识别异常。",
+            citations=list(cit_proc),
+        ),
+        PlanNode(
+            id="h5", type="condition", title="是否需要清理？",
+            command=(
+                "sh -c 'disk=$(df -P / 2>/dev/null | awk \"NR==2 {gsub(/%/, \\\"\\\", \\$5); print \\$5+0}\"); "
+                "mem=$(free 2>/dev/null | awk \"/Mem:/ {if (\\$2>0) print int(\\$3*100/\\$2); else print 0}\"); "
+                "if [ \"${disk:-0}\" -ge 85 ] || [ \"${mem:-0}\" -ge 85 ]; then "
+                "echo \"anomaly_detected disk=${disk:-na}% mem=${mem:-na}%\"; exit 0; "
+                "fi; echo \"healthy disk=${disk:-na}% mem=${mem:-na}%\"; exit 1'"
+            ),
+            risk_level=RiskLevel.safe, grounded=False,
+            description="根据检查结果判断是否需要清理临时文件或异常进程。",
+            citations=[],
+        ),
+        PlanNode(
+            id="h6", type="command", title="清理临时文件",
+            command="sh -c 'du -sh /tmp 2>/dev/null; find /tmp -type f -atime +7 2>/dev/null | head -20; echo \"(preview only, no deletion)\"'",
+            risk_level=RiskLevel.warn, grounded=False,
+            description="预览 /tmp 中超过 7 天未访问的文件（仅预览，不删除）。",
+            citations=[],
+            rollback="无需回滚（仅预览模式）。",
+        ),
+        PlanNode(
+            id="h7", type="verify", title="复查磁盘空间",
+            command="df -h /",
+            risk_level=RiskLevel.safe, grounded=bool(cit_disk),
+            description="确认根分区当前使用率。",
+            citations=list(cit_disk),
+        ),
+        PlanNode(
+            id="h8", type="end", title="巡检完成",
+            command="", risk_level=RiskLevel.safe, grounded=True,
+            description="服务器健康巡检完成，审计报告已生成。",
+            citations=[],
+        ),
+    ]
+    edges = [
+        PlanEdge(source_id="h0", target_id="h1", condition="success", label="开始"),
+        PlanEdge(source_id="h1", target_id="h2", condition="success", label="next"),
+        PlanEdge(source_id="h2", target_id="h3", condition="success", label="next"),
+        PlanEdge(source_id="h3", target_id="h4", condition="success", label="next"),
+        PlanEdge(source_id="h4", target_id="h5", condition="success", label="分析"),
+        PlanEdge(source_id="h5", target_id="h6", condition="success", label="需清理"),
+        PlanEdge(source_id="h5", target_id="h8", condition="failure", label="一切正常"),
+        PlanEdge(source_id="h6", target_id="h7", condition="success", label="复查"),
+        PlanEdge(source_id="h7", target_id="h8", condition="success", label="完成"),
+    ]
+    return ExecutionPlan(
+        id=str(uuid4()), intent=intent or "", nodes=nodes, edges=edges,
+        root_id="h0", generated_by="planner",
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+
+# ── Deploy Verify Plan ─────────────────────────────────────────────────────
+
+def _build_deploy_verify_plan(*, intent: str) -> ExecutionPlan:
+    """应用上线验证：进程→端口→健康接口→依赖→条件分支→完成"""
+    cit_port = retrieve("端口 ss 监听", limit=1)
+    cit_proc = retrieve("进程 ps", limit=1)
+
+    nodes = [
+        PlanNode(
+            id="d0", type="diagnose", title="开始上线验证",
+            command="", risk_level=RiskLevel.safe, grounded=False,
+            description=intent or "验证已部署服务是否正常运行",
+            citations=[],
+        ),
+        PlanNode(
+            id="d1", type="command", title="检查服务进程",
+            command="ps aux | grep -E 'python|uvicorn|gunicorn|node|java' | grep -v grep",
+            risk_level=RiskLevel.safe, grounded=bool(cit_proc),
+            description="确认应用进程是否存活。",
+            citations=list(cit_proc),
+        ),
+        PlanNode(
+            id="d2", type="command", title="检查端口监听",
+            command="ss -ltnp | grep -E ':7860|:8000|:8080|:80'",
+            risk_level=RiskLevel.safe, grounded=bool(cit_port),
+            description="确认服务端口是否在监听。",
+            citations=list(cit_port),
+        ),
+        PlanNode(
+            id="d3", type="command", title="测试健康接口",
+            command=(
+                "sh -c 'for url in "
+                "http://localhost:8000/api/health "
+                "http://localhost:7860/api/health "
+                "http://localhost:8080/api/health "
+                "http://localhost:80/api/health; do "
+                "if curl -sf \"$url\"; then exit 0; fi; "
+                "done; echo \"health check failed\"; exit 1'"
+            ),
+            risk_level=RiskLevel.safe, grounded=False,
+            description="调用健康检查 API，确认服务正常响应。",
+            citations=[],
+        ),
+        PlanNode(
+            id="d4", type="command", title="检查依赖完整性",
+            command="pip list --format=columns 2>/dev/null | head -15",
+            risk_level=RiskLevel.safe, grounded=False,
+            description="列出已安装的 Python 包，确认关键依赖存在。",
+            citations=[],
+        ),
+        PlanNode(
+            id="d5", type="condition", title="服务是否健康？",
+            command=(
+                "sh -c 'ps aux | grep -E \"python|uvicorn|gunicorn|node|java\" | grep -v grep >/dev/null "
+                "&& ss -ltnp | grep -E \":7860|:8000|:8080|:80\" >/dev/null "
+                "&& (curl -sf http://localhost:8000/api/health >/dev/null "
+                "|| curl -sf http://localhost:7860/api/health >/dev/null "
+                "|| curl -sf http://localhost:8080/api/health >/dev/null "
+                "|| curl -sf http://localhost:80/api/health >/dev/null) "
+                "&& python -m pip show fastapi >/dev/null 2>&1 "
+                "&& python -m pip show uvicorn >/dev/null 2>&1'"
+            ),
+            risk_level=RiskLevel.safe, grounded=False,
+            description="综合判断：进程存活、端口监听、健康接口正常、依赖完整。",
+            citations=[],
+        ),
+        PlanNode(
+            id="d6", type="command", title="查看最近日志",
+            command="tail -20 /home/ops/logs/app.log 2>/dev/null || echo 'no log file'",
+            risk_level=RiskLevel.safe, grounded=False,
+            description="如有异常，查看应用日志定位原因。",
+            citations=[],
+        ),
+        PlanNode(
+            id="d7", type="end", title="验证完成",
+            command="", risk_level=RiskLevel.safe, grounded=True,
+            description="应用上线验证完成，审计报告已生成。",
+            citations=[],
+        ),
+    ]
+    edges = [
+        PlanEdge(source_id="d0", target_id="d1", condition="success", label="开始"),
+        PlanEdge(source_id="d1", target_id="d2", condition="success", label="next"),
+        PlanEdge(source_id="d2", target_id="d3", condition="success", label="next"),
+        PlanEdge(source_id="d3", target_id="d4", condition="success", label="next"),
+        PlanEdge(source_id="d4", target_id="d5", condition="success", label="诊断"),
+        PlanEdge(source_id="d5", target_id="d7", condition="success", label="一切正常"),
+        PlanEdge(source_id="d5", target_id="d6", condition="failure", label="有异常"),
+        PlanEdge(source_id="d6", target_id="d7", condition="success", label="完成"),
+    ]
+    return ExecutionPlan(
+        id=str(uuid4()), intent=intent or "", nodes=nodes, edges=edges,
+        root_id="d0", generated_by="planner",
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+
+# ── Security Audit Plan ────────────────────────────────────────────────────
+
+def _build_security_audit_plan(*, intent: str) -> ExecutionPlan:
+    """安全合规审查：端口扫描→用户检查→进程检查→SUID→风险分支→完成"""
+    cit_port = retrieve("端口 ss 扫描", limit=1)
+    cit_perm = retrieve("权限 SUID 安全", limit=1)
+    cit_fw = retrieve("防火墙 iptables", limit=1)
+
+    nodes = [
+        PlanNode(
+            id="s0", type="diagnose", title="开始安全审查",
+            command="", risk_level=RiskLevel.safe, grounded=False,
+            description=intent or "对服务器进行安全合规审查",
+            citations=[],
+        ),
+        PlanNode(
+            id="s1", type="command", title="扫描开放端口",
+            command="ss -ltnp",
+            risk_level=RiskLevel.safe, grounded=bool(cit_port),
+            description="列出所有正在监听的 TCP 端口和对应进程。",
+            citations=list(cit_port),
+        ),
+        PlanNode(
+            id="s2", type="command", title="检查可登录用户",
+            command="cat /etc/passwd | grep -v -E 'nologin|false' | cut -d: -f1,6,7",
+            risk_level=RiskLevel.safe, grounded=False,
+            description="列出系统中可交互登录的用户账户。",
+            citations=[],
+        ),
+        PlanNode(
+            id="s3", type="command", title="查找异常进程",
+            command="ps aux --sort=-%cpu | head -10",
+            risk_level=RiskLevel.safe, grounded=False,
+            description="列出 CPU 占用最高的进程，排查挖矿或异常程序。",
+            citations=[],
+        ),
+        PlanNode(
+            id="s4", type="command", title="检查 SUID 文件",
+            command="find / -perm -4000 -type f 2>/dev/null | head -15",
+            risk_level=RiskLevel.safe, grounded=bool(cit_perm),
+            description="查找具有 SUID 权限的可执行文件，这些文件可能被利用提权。",
+            citations=list(cit_perm),
+        ),
+        PlanNode(
+            id="s5", type="condition", title="是否发现安全风险？",
+            command=(
+                "sh -c 'issues=0; "
+                "if grep -E \"^root:.*:(/bin/bash|/bin/sh)$\" /etc/passwd >/dev/null; then "
+                "echo \"risk: root_login_shell\"; issues=1; fi; "
+                "if ss -ltnp 2>/dev/null | grep -E \":(22|2375|3306|5432)\\\\b\" >/dev/null; then "
+                "echo \"risk: sensitive_port_exposed\"; issues=1; fi; "
+                "if [ \"$issues\" -eq 1 ]; then exit 0; fi; "
+                "echo \"no_obvious_high_risk_findings\"; exit 1'"
+            ),
+            risk_level=RiskLevel.safe, grounded=False,
+            description="综合评估：异常端口、可疑用户、高 CPU 进程、危险 SUID 文件。",
+            citations=[],
+        ),
+        PlanNode(
+            id="s6", type="human", title="风险项需人工确认",
+            command="", risk_level=RiskLevel.warn, grounded=False,
+            description="发现潜在风险项，需要安全工程师确认是否需要修复。",
+            citations=[],
+        ),
+        PlanNode(
+            id="s7", type="verify", title="检查防火墙规则",
+            command="iptables -L -n 2>/dev/null | head -20 || echo 'iptables not available'",
+            risk_level=RiskLevel.safe, grounded=bool(cit_fw),
+            description="查看当前防火墙规则，确认安全策略是否生效。",
+            citations=list(cit_fw),
+        ),
+        PlanNode(
+            id="s8", type="end", title="安全审查完成",
+            command="", risk_level=RiskLevel.safe, grounded=True,
+            description="安全合规审查完成，审计报告已生成。",
+            citations=[],
+        ),
+    ]
+    edges = [
+        PlanEdge(source_id="s0", target_id="s1", condition="success", label="开始"),
+        PlanEdge(source_id="s1", target_id="s2", condition="success", label="next"),
+        PlanEdge(source_id="s2", target_id="s3", condition="success", label="next"),
+        PlanEdge(source_id="s3", target_id="s4", condition="success", label="next"),
+        PlanEdge(source_id="s4", target_id="s5", condition="success", label="评估"),
+        PlanEdge(source_id="s5", target_id="s6", condition="success", label="有风险"),
+        PlanEdge(source_id="s5", target_id="s7", condition="failure", label="无异常"),
+        PlanEdge(source_id="s6", target_id="s7", condition="success", label="已确认"),
+        PlanEdge(source_id="s7", target_id="s8", condition="success", label="完成"),
+    ]
+    return ExecutionPlan(
+        id=str(uuid4()), intent=intent or "", nodes=nodes, edges=edges,
+        root_id="s0", generated_by="planner",
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+
+# ── Plan Router ────────────────────────────────────────────────────────────
+
 def build_execution_plan(*, intent: str, suggestions: list[CommandSuggestion]) -> ExecutionPlan:
     """Build a minimal DAG execution plan from ordered command suggestions."""
+
+    # Scenario-specific plans (rich DAGs with branches)
+    # Order matters: check more specific scenarios first to avoid cross-triggering.
+    if _is_health_check_scenario(intent):
+        return _build_health_check_plan(intent=intent)
+
+    if _is_security_audit_scenario(intent):
+        return _build_security_audit_plan(intent=intent)
+
+    if _is_deploy_verify_scenario(intent):
+        return _build_deploy_verify_plan(intent=intent)
 
     if _is_port_in_use_scenario(intent, suggestions):
         return _build_port_in_use_plan(intent=intent, suggestions=suggestions)

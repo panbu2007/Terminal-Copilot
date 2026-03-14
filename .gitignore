@@ -23,6 +23,7 @@ frontend/dist/
 
 # local editor / agent config
 .claude/
+.serena/
 .vscode/
 AGENTS.md
 CLAUDE.md
