@@ -825,14 +825,29 @@ async def api_suggest_stream(req: SuggestRequest) -> StreamingResponse:
         try:
             cached_demo_suggestions = _load_demo_cached_suggestions(req)
             if cached_demo_suggestions:
-                q.put(
-                    {
-                        "type": "agent_progress",
-                        "agent": "orchestrator",
-                        "status": "done",
-                        "message": "Demo cache hit. Reusing the last successful LLM result.",
-                    }
-                )
+                replay_events = [
+                    ("orchestrator", "start", "Replaying cached demo workflow..."),
+                    ("diag", "start", "Re-checking diagnostic context..."),
+                    ("diag", "done", "Diagnostic context restored from cache."),
+                    ("rag", "start", "Replaying knowledge lookup..."),
+                    ("rag", "done", "Cached citations loaded."),
+                    ("executor", "start", "Rebuilding command suggestions..."),
+                    ("executor", "done", "Cached suggestion set restored."),
+                    ("safety", "start", "Replaying safety review..."),
+                    ("safety", "done", "Cached safety review restored."),
+                    ("orchestrator", "done", "Demo cache hit. Reusing the last successful LLM result."),
+                ]
+                for agent, status, message in replay_events:
+                    q.put(
+                        {
+                            "type": "agent_progress",
+                            "agent": agent,
+                            "status": status,
+                            "message": message,
+                        }
+                    )
+                    if status == "start":
+                        time.sleep(0.12)
                 q.put(
                     {
                         "type": "suggestions",
