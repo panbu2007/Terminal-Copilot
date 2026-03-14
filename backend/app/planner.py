@@ -388,8 +388,8 @@ def _build_health_check_plan(*, intent: str) -> ExecutionPlan:
                 "sh -c 'disk=$(df -P / 2>/dev/null | awk \"NR==2 {gsub(/%/, \\\"\\\", \\$5); print \\$5+0}\"); "
                 "mem=$(free 2>/dev/null | awk \"/Mem:/ {if (\\$2>0) print int(\\$3*100/\\$2); else print 0}\"); "
                 "if [ \"${disk:-0}\" -ge 85 ] || [ \"${mem:-0}\" -ge 85 ]; then "
-                "echo \"anomaly_detected disk=${disk:-na}% mem=${mem:-na}%\"; exit 0; "
-                "fi; echo \"healthy disk=${disk:-na}% mem=${mem:-na}%\"; exit 1'"
+                "echo \"anomaly_detected disk=${disk:-na}% mem=${mem:-na}%\"; exit 1; "
+                "fi; echo \"healthy disk=${disk:-na}% mem=${mem:-na}%\"; exit 0'"
             ),
             risk_level=RiskLevel.safe, grounded=False,
             description="根据检查结果判断是否需要清理临时文件或异常进程。",
@@ -423,8 +423,8 @@ def _build_health_check_plan(*, intent: str) -> ExecutionPlan:
         PlanEdge(source_id="h2", target_id="h3", condition="success", label="next"),
         PlanEdge(source_id="h3", target_id="h4", condition="success", label="next"),
         PlanEdge(source_id="h4", target_id="h5", condition="success", label="分析"),
-        PlanEdge(source_id="h5", target_id="h6", condition="success", label="需清理"),
-        PlanEdge(source_id="h5", target_id="h8", condition="failure", label="一切正常"),
+        PlanEdge(source_id="h5", target_id="h6", condition="failure", label="需清理"),
+        PlanEdge(source_id="h5", target_id="h8", condition="success", label="一切正常"),
         PlanEdge(source_id="h6", target_id="h7", condition="success", label="复查"),
         PlanEdge(source_id="h7", target_id="h8", condition="success", label="完成"),
     ]
