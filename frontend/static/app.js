@@ -282,7 +282,7 @@ function clearTimeline() {
 const DEMO_INTENTS = {
   health: '对这台服务器做一次全面健康巡检：检查磁盘空间、内存使用、CPU 负载、异常进程，有问题就修复，最后生成巡检报告。',
   deploy: '刚部署了一个服务，帮我验证它是否正常运行：检查进程是否存活、端口是否监听、健康接口是否响应、依赖是否完整。',
-  security: '对这台服务器做一次安全审查：扫描开放端口、检查可登录用户、查找异常进程、检查 SUID 文件权限，生成安全审计报告。',
+  port: 'demo port replan 18080: simulate occupancy on demo port 18080, do a first pass, and auto-extend follow-up steps if the port is still busy.',
 };
 
 function joinDemoPath(base, child) {
@@ -299,7 +299,7 @@ function quoteCdPath(target) {
 function getDemoTargetCwd(key) {
   if (!demoLocalRoot) return '';
   if (key === 'deploy' && demoWorkspaceAvailable) return joinDemoPath(demoLocalRoot, 'workspace');
-  if (key === 'health' || key === 'security') return demoLocalRoot;
+  if (key === 'health' || key === 'port') return demoLocalRoot;
   return '';
 }
 
@@ -327,6 +327,7 @@ let currentPlanIntent = '';
 let currentAuditReport = null;
 let currentSuggestStream = null;
 let currentPlanStream = null;
+let currentPlanAutoRunLevel = 'none';
 let latestRunbookItems = [];
 let currentPlanNodeOutputs = {};
 let currentPlanNodeStatuses = {};
@@ -409,6 +410,7 @@ function switchSidePanel(name) {
 }
 
 let _rafLayoutPending = false;
+
 function refreshResponsiveLayout() {
   if (_rafLayoutPending) return;
   _rafLayoutPending = true;
@@ -554,6 +556,7 @@ class PlanGraphRenderer {
     this.editMode = false;
     this.zoom = null;
     this.currentTransform = null;
+    this.onNodeClick = null;
   }
 
   clear() {
@@ -590,6 +593,7 @@ class PlanGraphRenderer {
 
   render(plan, { onNodeClick } = {}) {
     this.plan = plan;
+    this.onNodeClick = typeof onNodeClick === 'function' ? onNodeClick : null;
     if (!this.container) return;
     if (!plan || !Array.isArray(plan.nodes) || plan.nodes.length === 0) {
       this.clear();
@@ -701,7 +705,7 @@ class PlanGraphRenderer {
         })
         .on('click', (event) => {
           event.stopPropagation();
-          if (typeof onNodeClick === 'function') onNodeClick(node, event.currentTarget);
+          if (this.onNodeClick) this.onNodeClick(node, event.currentTarget);
         });
 
       const w = layoutNode.width;
@@ -842,6 +846,63 @@ class PlanGraphRenderer {
         .classed('edge-failed', normalized === 'failed');
     }
   }
+
+  appendNodes(newNodes, newEdges) {
+    if (!this.plan || !Array.isArray(newNodes) || !newNodes.length) return;
+
+    const existingNodeIds = new Set((this.plan.nodes || []).map((node) => node.id));
+    const existingEdgeKeys = new Set(
+      (this.plan.edges || []).map((edge) => `${edge.source_id}|${edge.target_id}|${edge.condition || ''}|${edge.label || ''}`)
+    );
+
+    const appendedNodeIds = [];
+    const mergedNodes = [...(this.plan.nodes || [])];
+    for (const node of newNodes) {
+      if (existingNodeIds.has(node.id)) continue;
+      existingNodeIds.add(node.id);
+      mergedNodes.push(node);
+      appendedNodeIds.push(node.id);
+      currentPlanNodeStatuses[node.id] = currentPlanNodeStatuses[node.id] || 'pending';
+      currentPlanNodeOutputs[node.id] = currentPlanNodeOutputs[node.id] || { stdout: '', stderr: '', exit_code: null };
+    }
+
+    const mergedEdges = [...(this.plan.edges || [])];
+    for (const edge of (Array.isArray(newEdges) ? newEdges : [])) {
+      const key = `${edge.source_id}|${edge.target_id}|${edge.condition || ''}|${edge.label || ''}`;
+      if (existingEdgeKeys.has(key)) continue;
+      existingEdgeKeys.add(key);
+      mergedEdges.push(edge);
+    }
+
+    if (!appendedNodeIds.length) return;
+
+    const prevStatuses = { ...currentPlanNodeStatuses };
+    this.plan.nodes = mergedNodes;
+    this.plan.edges = mergedEdges;
+    if (currentPlan) {
+      currentPlan.nodes = mergedNodes;
+      currentPlan.edges = mergedEdges;
+    }
+
+    this.render(this.plan, { onNodeClick: this.onNodeClick });
+
+    for (const [nodeId, status] of Object.entries(prevStatuses)) {
+      this.updateNodeStatus(nodeId, status);
+    }
+    for (const nodeId of appendedNodeIds) {
+      const nodeEl = this.nodeEls.get(nodeId);
+      if (!nodeEl) continue;
+      nodeEl.classed('plan-node-appended', true);
+      nodeEl.select('.node-bg').attr('stroke-dasharray', '6 3');
+      nodeEl.select('.badge-icon').text('+');
+    }
+
+    updatePlanOpBar();
+    if (currentPopoverNodeId) {
+      const current = getCurrentPlanNode(currentPopoverNodeId);
+      if (current) openNodePopover(current, null, currentPlanNodeStatuses[currentPopoverNodeId] === 'awaiting_approval');
+    }
+  }
 }
 
 class PlanStreamClient {
@@ -870,6 +931,23 @@ class PlanStreamClient {
   handleEvent(payload) {
     if (!payload || !payload.type) return;
     if (payload.type === 'heartbeat') return;
+    if (payload.type === 'replan_starting') {
+      const nodeEl = this.renderer.nodeEls.get(payload.failed_node_id);
+      if (nodeEl) nodeEl.select('.badge-icon').text('...');
+      writePlanTerminalLine('[REPLAN] Generating follow-up steps...', '\x1b[33m');
+      return;
+    }
+    if (payload.type === 'nodes_appended') {
+      const newNodes = Array.isArray(payload.nodes) ? payload.nodes : [];
+      const newEdges = Array.isArray(payload.edges) ? payload.edges : [];
+      this.renderer.appendNodes(newNodes, newEdges);
+      writePlanTerminalLine(`[REPLAN] Appended ${newNodes.length} follow-up node(s).`, '\x1b[32m');
+      return;
+    }
+    if (payload.type === 'replan_failed') {
+      writePlanTerminalLine(`[REPLAN] Extension unavailable: ${payload.reason || 'no follow-up generated'}`, '\x1b[33m');
+      return;
+    }
     if (payload.type === 'node_start') {
       currentPlanNodeStatuses[payload.node_id] = 'running';
       trackPlanNodeStart(payload.node_id, payload.command || '');
@@ -1063,7 +1141,10 @@ function renderAuditReport(report) {
     return;
   }
   const overall = String(report.overall || 'PASS').toUpperCase();
-  const verdictClass = overall === 'FAIL' ? 'fail' : report.failed > 0 || report.skipped > 0 ? 'warn' : 'pass';
+  const actionableSkipped = Number(report.actionable_skipped || 0);
+  const branchSkipped = Number(report.branch_skipped || 0);
+  const effectiveTotal = Number(report.effective_total || report.total || 0);
+  const verdictClass = overall === 'FAIL' ? 'fail' : report.failed > 0 || actionableSkipped > 0 ? 'warn' : 'pass';
   const verdictIcon = verdictClass === 'fail' ? '✕' : verdictClass === 'warn' ? '!' : '✓';
   auditContentEl.innerHTML = '';
   const verdict = document.createElement('div');
@@ -1071,7 +1152,7 @@ function renderAuditReport(report) {
   verdict.innerHTML = `
     <div class="audit-verdict-icon">${verdictIcon}</div>
     <div class="audit-verdict-label">${escapeHtml(overall)}</div>
-    <div class="audit-verdict-stats">${report.passed || 0}/${report.total || 0} 通过 · ${report.failed || 0} 失败 · ${report.skipped || 0} 跳过</div>
+    <div class="audit-verdict-stats">${report.passed || 0}/${effectiveTotal || 0} 通过 · ${report.failed || 0} 失败 · ${actionableSkipped} 跳过${branchSkipped ? ` · ${branchSkipped} 未命中分支` : ''}</div>
   `;
   auditContentEl.appendChild(verdict);
 
@@ -1126,9 +1207,14 @@ function renderAuditReport(report) {
     row.className = 'audit-finding severity-info';
     const output = node.output || {};
     const excerpt = String(output.stderr || output.stdout || '').trim().slice(0, 180);
+    const skipReason = node.skip_reason === 'unreachable'
+      ? ' · 分支未命中'
+      : node.skip_reason
+        ? ` · 跳过原因: ${escapeHtml(String(node.skip_reason))}`
+        : '';
     row.innerHTML = `
       <div class="audit-finding-header">${escapeHtml(node.title || node.node_id)} · ${escapeHtml(node.status || '')}</div>
-      <div class="audit-finding-msg">类型: ${escapeHtml(node.type || 'command')} · 风险: ${escapeHtml(node.risk_level || 'safe')} · 依据: ${node.grounded ? 'grounded' : 'unverified'}${excerpt ? ` · 输出: ${escapeHtml(excerpt)}` : ''}</div>
+      <div class="audit-finding-msg">类型: ${escapeHtml(node.type || 'command')} · 风险: ${escapeHtml(node.risk_level || 'safe')} · 依据: ${node.grounded ? 'grounded' : 'unverified'}${skipReason}${excerpt ? ` · 输出: ${escapeHtml(excerpt)}` : ''}</div>
     `;
     auditContentEl.appendChild(row);
   }
@@ -1149,17 +1235,28 @@ function renderAuditReport(report) {
       `- Plan ID: ${report.plan_id || ''}`,
       `- Intent: ${report.intent || ''}`,
       `- Overall: ${overall}`,
-      `- Passed: ${report.passed || 0}/${report.total || 0}`,
+      `- Passed: ${report.passed || 0}/${effectiveTotal || 0}`,
+      `- Failed: ${report.failed || 0}`,
+      `- Skipped: ${actionableSkipped}`,
+      ...(branchSkipped ? [`- Branch Not Taken: ${branchSkipped}`] : []),
       ``,
       ...(analysis ? [`## Analysis`, ``, `- Severity: ${analysis.severity || ''}`, `- Summary: ${analysis.summary || ''}`, ``] : []),
       `## Nodes`,
-      ...((report.nodes || []).map((node) => `- ${node.title || node.node_id}: ${node.status} (${node.risk_level})`)),
+      ...((report.nodes || []).map((node) => `- ${node.title || node.node_id}: ${node.status}${node.skip_reason ? ` [${node.skip_reason}]` : ''} (${node.risk_level})`)),
     ];
     downloadText(`audit-${report.plan_id || 'report'}.md`, lines.join('\n'));
   };
   exportBar.appendChild(btnJson);
   exportBar.appendChild(btnMd);
   auditContentEl.appendChild(exportBar);
+}
+
+function _updateAutoRunGroup() {
+  const group = document.getElementById('planAutoRunGroup');
+  if (!group) return;
+  for (const btn of group.querySelectorAll('.auto-run-btn')) {
+    btn.classList.toggle('active', btn.dataset.level === currentPlanAutoRunLevel);
+  }
 }
 
 function updatePlanOpBar() {
@@ -1174,6 +1271,47 @@ function updatePlanOpBar() {
   const groundedCount = currentPlan.nodes.filter((node) => node.grounded).length;
   const preAudit = currentPlan && currentPlan.pre_audit ? currentPlan.pre_audit : null;
   const severity = String((preAudit && preAudit.severity) || '').trim().toLowerCase();
+  // Auto-run segmented button group
+  let autoRunGroup = document.getElementById('planAutoRunGroup');
+  if (!autoRunGroup) {
+    const btnsBar = planOpTitleEl && planOpTitleEl.closest('.plan-op-bar');
+    if (btnsBar) {
+      const group = document.createElement('div');
+      group.id = 'planAutoRunGroup';
+      group.className = 'auto-run-group';
+
+      const lbl = document.createElement('span');
+      lbl.className = 'auto-run-group-label';
+      lbl.textContent = 'Auto-run';
+      group.appendChild(lbl);
+
+      const opts = [['none', 'Off'], ['safe', 'Safe'], ['safe_warn', 'Safe+warn']];
+      for (const [val, text] of opts) {
+        const btn = document.createElement('button');
+        btn.className = 'auto-run-btn';
+        btn.dataset.level = val;
+        btn.textContent = text;
+        btn.addEventListener('click', async () => {
+          currentPlanAutoRunLevel = val;
+          _updateAutoRunGroup();
+          if (currentPlan && currentPlan.id && currentPlanStream && currentPlanStream.source) {
+            try { await apiPlanSetAutoRun(currentPlan.id, val); } catch { /* ignore */ }
+          }
+        });
+        group.appendChild(btn);
+      }
+
+      // Insert before .plan-op-btns so it sits in the bar naturally
+      const planOpBtns = btnsBar.querySelector('.plan-op-btns');
+      if (planOpBtns) {
+        btnsBar.insertBefore(group, planOpBtns);
+      } else {
+        btnsBar.appendChild(group);
+      }
+      autoRunGroup = group;
+    }
+  }
+  _updateAutoRunGroup();
   if (planPreAuditEl) {
     if (severity) {
       planPreAuditEl.dataset.severity = severity;
@@ -2030,7 +2168,12 @@ async function apiPlanGenerate(intent, suggestions = []) {
 async function apiPlanExecute(planId) {
   return postJson(`/api/plan/${encodeURIComponent(planId)}/execute`, {
     session_id: getSessionId() || null,
+    auto_run_level: currentPlanAutoRunLevel,
   });
+}
+
+async function apiPlanSetAutoRun(planId, level) {
+  return postJson(`/api/plan/${encodeURIComponent(planId)}/auto-run`, { level });
 }
 
 async function apiPlanApproveNode(planId, nodeId) {
@@ -2591,9 +2734,8 @@ if (typeof ResizeObserver !== 'undefined') {
   const responsiveObserver = new ResizeObserver(() => {
     refreshResponsiveLayout();
   });
-  // Observe topbar and onboarding only — NOT layoutEl, because fitAddon.fit()
-  // changes the terminal height which propagates to layoutEl, creating an
-  // infinite resize feedback loop that causes flickering on mobile.
+  // Observe topbar and onboarding only. Observing layoutEl creates a feedback
+  // loop because fitAddon.fit() changes terminal height and retriggers resize.
   if (topbarEl) responsiveObserver.observe(topbarEl);
   if (onboardingEl) responsiveObserver.observe(onboardingEl);
 }

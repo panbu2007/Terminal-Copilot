@@ -18,7 +18,7 @@ from uuid import UUID
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket
 from pydantic import BaseModel
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .executor import get_executor, get_executor_mode, set_executor_mode
@@ -825,14 +825,29 @@ async def api_suggest_stream(req: SuggestRequest) -> StreamingResponse:
         try:
             cached_demo_suggestions = _load_demo_cached_suggestions(req)
             if cached_demo_suggestions:
-                q.put(
-                    {
-                        "type": "agent_progress",
-                        "agent": "orchestrator",
-                        "status": "done",
-                        "message": "Demo cache hit. Reusing the last successful LLM result.",
-                    }
-                )
+                replay_events = [
+                    ("orchestrator", "start", "Replaying cached demo workflow..."),
+                    ("diag", "start", "Re-checking diagnostic context..."),
+                    ("diag", "done", "Diagnostic context restored from cache."),
+                    ("rag", "start", "Replaying knowledge lookup..."),
+                    ("rag", "done", "Cached citations loaded."),
+                    ("executor", "start", "Rebuilding command suggestions..."),
+                    ("executor", "done", "Cached suggestion set restored."),
+                    ("safety", "start", "Replaying safety review..."),
+                    ("safety", "done", "Cached safety review restored."),
+                    ("orchestrator", "done", "Demo cache hit. Reusing the last successful LLM result."),
+                ]
+                for agent, status, message in replay_events:
+                    q.put(
+                        {
+                            "type": "agent_progress",
+                            "agent": agent,
+                            "status": status,
+                            "message": message,
+                        }
+                    )
+                    if status == "start":
+                        time.sleep(0.12)
                 q.put(
                     {
                         "type": "suggestions",
@@ -1401,6 +1416,11 @@ def api_interrupt(req: InterruptRequest) -> InterruptResponse:
 
 class PlanExecuteRequest(BaseModel):
     session_id: str | None = None
+    auto_run_level: str = "none"
+
+
+class PlanAutoRunRequest(BaseModel):
+    level: str = "none"
 
 
 @app.post("/api/plan/{plan_id}/execute")
@@ -1421,7 +1441,17 @@ def api_plan_execute(plan_id: str, req: PlanExecuteRequest) -> dict:
             os.getenv("TERMINAL_COPILOT_LOCAL_ROOT", str(REPO_ROOT))
         ).resolve()
         session.cwd = str(local_root)
-    start_plan_execution(plan, session_id=str(session.id), cwd=session.cwd)
+    level = (
+        req.auto_run_level
+        if req.auto_run_level in {"none", "safe", "safe_warn"}
+        else "none"
+    )
+    start_plan_execution(
+        plan,
+        session_id=str(session.id),
+        cwd=session.cwd,
+        auto_run_level=level,
+    )
     return {"ok": True, "plan_id": plan.id}
 
 
@@ -1470,6 +1500,23 @@ def api_plan_node_skip(plan_id: str, node_id: str) -> dict:
 def api_plan_cancel(plan_id: str) -> dict:
     ok = cancel_plan(plan_id)
     return {"ok": ok}
+
+
+@app.post("/api/plan/{plan_id}/auto-run")
+def api_plan_auto_run(plan_id: str, req: PlanAutoRunRequest):
+    if req.level not in {"none", "safe", "safe_warn"}:
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "error": "invalid level"},
+        )
+    state = get_plan_state(plan_id)
+    if state is None:
+        return JSONResponse(
+            status_code=404,
+            content={"ok": False, "error": "plan not found"},
+        )
+    state.auto_run_level = req.level
+    return {"ok": True, "new_level": req.level}
 
 
 @app.get("/api/runbooks", response_model=RunbookListResponse)

@@ -6,9 +6,10 @@ from dataclasses import dataclass, field
 from queue import Queue
 from typing import Any
 
+from .agents.replan_agent import ReplanAgent
 from .agents.safety_agent import SafetyAgent
 from .executor import get_executor
-from .models import ExecutionPlan, PlanNode
+from .models import ExecutionPlan, PlanEdge, PlanNode
 
 
 # ── State ─────────────────────────────────────────────────────────────────────
@@ -25,10 +26,14 @@ class PlanExecutionState:
     approve_events: dict[str, threading.Event] = field(default_factory=dict)
     skipped_by_user: set[str] = field(default_factory=set)
     cancel_event: threading.Event = field(default_factory=threading.Event)
+    auto_run_level: str = "none"
+    appended_nodes: list[PlanNode] = field(default_factory=list)
+    appended_edges: list[PlanEdge] = field(default_factory=list)
 
 
 _ACTIVE_PLANS: dict[str, PlanExecutionState] = {}
 _AUDITOR = SafetyAgent()
+_REPLANNER = ReplanAgent()
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
@@ -38,8 +43,14 @@ def start_plan_execution(
     *,
     session_id: str,
     cwd: str,
+    auto_run_level: str = "none",
 ) -> PlanExecutionState:
-    state = PlanExecutionState(plan=plan, session_id=session_id, cwd=cwd)
+    state = PlanExecutionState(
+        plan=plan,
+        session_id=session_id,
+        cwd=cwd,
+        auto_run_level=auto_run_level,
+    )
     for node in plan.nodes:
         state.node_statuses[node.id] = "pending"
         # Pre-create approve events for nodes that may need them
@@ -91,6 +102,36 @@ def _emit(state: PlanExecutionState, evt: dict[str, Any] | None) -> None:
     state.event_queue.put(evt)
 
 
+def _inject_extension(
+    state: PlanExecutionState,
+    nodes: dict[str, PlanNode],
+    out_edges: dict[str, list[tuple[str, str]]],
+    in_degree: dict[str, int],
+    new_nodes: list[PlanNode],
+    new_edges: list[PlanEdge],
+) -> None:
+    for node in new_nodes:
+        nodes[node.id] = node
+        in_degree[node.id] = 0
+        out_edges[node.id] = []
+        state.node_statuses[node.id] = "pending"
+        state.approve_events[node.id] = threading.Event()
+        state.plan.nodes.append(node)
+
+    new_node_ids = {n.id for n in new_nodes}
+    for edge in new_edges:
+        src = edge.source_id
+        tgt = edge.target_id
+        if src in out_edges:
+            out_edges[src].append((tgt, edge.condition or "always"))
+        if tgt in in_degree and src in new_node_ids:
+            in_degree[tgt] = in_degree.get(tgt, 0) + 1
+        state.plan.edges.append(edge)
+
+    state.appended_nodes.extend(new_nodes)
+    state.appended_edges.extend(new_edges)
+
+
 def _execute_plan(state: PlanExecutionState) -> None:  # noqa: C901
     state.status = "running"
     plan = state.plan
@@ -134,6 +175,41 @@ def _execute_plan(state: PlanExecutionState) -> None:  # noqa: C901
         node_status = _execute_node(state, node)
         state.node_statuses[node_id] = node_status
 
+        if (
+            node.type == "condition"
+            and node_status == "failed"
+            and node_id not in {n.id for n in state.appended_nodes}
+        ):
+            _emit(state, {"type": "replan_starting", "failed_node_id": node_id})
+            new_nodes, new_edges = _REPLANNER.generate_extension(
+                plan_intent=plan.intent,
+                failed_node=node,
+                stdout=state.node_outputs.get(node_id, {}).get("stdout", ""),
+                stderr=state.node_outputs.get(node_id, {}).get("stderr", ""),
+                existing_node_ids=set(nodes.keys()),
+            )
+            if state.cancel_event.is_set():
+                continue
+            if new_nodes:
+                _inject_extension(state, nodes, out_edges, in_degree, new_nodes, new_edges)
+                _emit(
+                    state,
+                    {
+                        "type": "nodes_appended",
+                        "nodes": [n.model_dump() for n in new_nodes],
+                        "edges": [e.model_dump() for e in new_edges],
+                    },
+                )
+                queue.extend([n.id for n in new_nodes if in_degree.get(n.id, 0) == 0])
+            else:
+                _emit(
+                    state,
+                    {
+                        "type": "replan_failed",
+                        "reason": "LLM unavailable or no extension generated",
+                    },
+                )
+
         # Enqueue successors based on edge conditions
         for (tgt, cond) in out_edges.get(node_id, []):
             if tgt in visited:
@@ -151,6 +227,7 @@ def _execute_plan(state: PlanExecutionState) -> None:  # noqa: C901
             continue
         if state.node_statuses.get(nid) in {"pending", "awaiting_approval"}:
             state.node_statuses[nid] = "skipped"
+            state.node_outputs.setdefault(nid, {})["skip_reason"] = "unreachable"
             _emit(state, {"type": "node_skipped", "node_id": nid, "reason": "unreachable"})
 
     # Build audit report
@@ -158,6 +235,14 @@ def _execute_plan(state: PlanExecutionState) -> None:  # noqa: C901
     passed = sum(1 for s in state.node_statuses.values() if s == "passed")
     failed = sum(1 for s in state.node_statuses.values() if s == "failed")
     skipped = sum(1 for s in state.node_statuses.values() if s == "skipped")
+    branch_skipped = sum(
+        1
+        for nid, status in state.node_statuses.items()
+        if status == "skipped"
+        and state.node_outputs.get(nid, {}).get("skip_reason") == "unreachable"
+    )
+    actionable_skipped = skipped - branch_skipped
+    effective_total = total - branch_skipped
 
     has_fail = failed > 0
     overall = "FAIL" if has_fail else "PASS"
@@ -165,6 +250,7 @@ def _execute_plan(state: PlanExecutionState) -> None:  # noqa: C901
     node_report = []
     for nid, ns in state.node_statuses.items():
         n = nodes.get(nid)
+        output = state.node_outputs.get(nid, {})
         node_report.append({
             "node_id": nid,
             "title": n.title if n else nid,
@@ -172,7 +258,8 @@ def _execute_plan(state: PlanExecutionState) -> None:  # noqa: C901
             "risk_level": n.risk_level if n else "safe",
             "grounded": bool(n.grounded) if n else False,
             "type": n.type if n else "command",
-            "output": state.node_outputs.get(nid, {}),
+            "output": output,
+            "skip_reason": output.get("skip_reason", ""),
         })
 
     report = {
@@ -180,9 +267,12 @@ def _execute_plan(state: PlanExecutionState) -> None:  # noqa: C901
         "intent": plan.intent,
         "overall": overall,
         "total": total,
+        "effective_total": effective_total,
         "passed": passed,
         "failed": failed,
         "skipped": skipped,
+        "actionable_skipped": actionable_skipped,
+        "branch_skipped": branch_skipped,
         "nodes": node_report,
     }
     report["analysis"] = _AUDITOR.summarize_execution_audit(report)
@@ -191,6 +281,8 @@ def _execute_plan(state: PlanExecutionState) -> None:  # noqa: C901
     _emit(state, None)  # sentinel
 
     state.status = "completed" if not has_fail else "failed"
+
+
 def _execute_node(state: PlanExecutionState, node: PlanNode) -> str:
     """Execute a single node; return final status string."""
     nid = node.id
@@ -202,7 +294,14 @@ def _execute_node(state: PlanExecutionState, node: PlanNode) -> str:
         return "passed"
 
     # Nodes requiring approval: block / human type / warn with command
-    needs_approval = (
+    auto_approve = (
+        (state.auto_run_level == "safe" and node.risk_level == "safe")
+        or (
+            state.auto_run_level == "safe_warn"
+            and node.risk_level in {"safe", "warn"}
+        )
+    )
+    needs_approval = not auto_approve and (
         node.risk_level == "block"
         or node.type == "human"
         or (node.risk_level == "warn" and cmd)
@@ -224,16 +323,19 @@ def _execute_node(state: PlanExecutionState, node: PlanNode) -> str:
             return "skipped"
 
         if nid in state.skipped_by_user:
+            state.node_outputs[nid] = {"skip_reason": "skipped_by_user"}
             _emit(state, {"type": "node_skipped", "node_id": nid, "reason": "skipped_by_user"})
             return "skipped"
 
         if not approved:
+            state.node_outputs[nid] = {"skip_reason": "approval_timeout"}
             # Timed out or cancelled — skip the node
             _emit(state, {"type": "node_skipped", "node_id": nid, "reason": "approval_timeout"})
             return "skipped"
 
         # If risk==block, even after approval we don't run the command
         if node.risk_level == "block":
+            state.node_outputs[nid] = {"skip_reason": "blocked_by_policy"}
             _emit(state, {"type": "node_skipped", "node_id": nid, "reason": "blocked_by_policy"})
             return "skipped"
 
