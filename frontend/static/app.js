@@ -1527,11 +1527,11 @@ async function approveAllPlanNodes() {
   writePlanTerminalLine('[PLAN] 已记录全部批准，后续待审批节点会自动放行。', '\x1b[36m');
 }
 
-async function startIntentIteration(intent, { autoExecute = false, generatePlan = true } = {}) {
+async function startIntentIteration(intent, { autoExecute = false, generatePlan = true, streamPayload = {} } = {}) {
   const normalized = String(intent || '').trim();
   if (!normalized) return;
   try {
-    const sug = await streamSuggestionsForIntent(normalized);
+    const sug = await streamSuggestionsForIntent(normalized, streamPayload);
     if (sug && sug.session_id) setSessionId(sug.session_id);
     renderSteps(sug.steps || []);
     renderSuggestions(
@@ -1558,7 +1558,11 @@ async function startIntentIteration(intent, { autoExecute = false, generatePlan 
       }
     );
     if (generatePlan) {
-      await generateExecutionPlan(normalized, sug.suggestions || []);
+      try {
+        await generateExecutionPlan(normalized, sug.suggestions || []);
+      } catch (planErr) {
+        writeInfoAbovePrompt(`执行计划生成失败，已保留建议列表：${String(planErr.message || planErr)}`);
+      }
     }
     // Actual execution must be a separate user action from the plan panel.
     void autoExecute;
@@ -3291,7 +3295,14 @@ for (const btn of demoBtnEls) {
     refreshResponsiveLayout();
     await ensureDemoContext(key);
     echoIntentToTerminal(intent);
-    await startIntentIteration(intent, { autoExecute: false });
+    await startIntentIteration(intent, {
+      autoExecute: false,
+      streamPayload: {
+        extra: {
+          demo_key: key,
+        },
+      },
+    });
   });
 }
 if (onboardingCloseEl) {

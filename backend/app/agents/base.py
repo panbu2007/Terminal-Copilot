@@ -66,7 +66,7 @@ class BaseAgent:
         all_tool_records: list[dict] = []
 
         for iteration in range(max_iterations):
-            content, tool_calls = modelscope_chat_with_tools(
+            content, tool_calls, assistant_message = modelscope_chat_with_tools(
                 messages,
                 tools=tools,
                 temperature=temperature,
@@ -78,11 +78,7 @@ class BaseAgent:
                 return content, all_tool_records
 
             # 把模型的 tool_calls 加入 messages
-            messages.append({
-                "role": "assistant",
-                "content": content or "",
-                "tool_calls": tool_calls,
-            })
+            messages.append(assistant_message)
 
             # 执行每个工具调用，把结果回填
             for call in tool_calls:
@@ -106,7 +102,7 @@ class BaseAgent:
                 })
 
         # 超出最大迭代，最后调用一次让模型汇总
-        content, _ = modelscope_chat_with_tools(
+        content, _, _ = modelscope_chat_with_tools(
             messages,
             tools=[],  # 不再提供工具，强制输出最终答案
             temperature=temperature,

@@ -48,7 +48,14 @@ from .models import (
     SuggestRequest,
     SuggestResponse,
 )
-from .llm.modelscope_client import PROVIDERS, normalize_provider, resolve_llm_config
+from .llm.modelscope_client import (
+    PROVIDERS,
+    normalize_chat_temperature,
+    normalize_provider,
+    resolve_llm_config,
+    urlopen_without_proxy,
+)
+from .demo_cache import load_demo_suggestions, save_demo_suggestions
 from .local_secrets import (
     write_llm_base_url,
     write_llm_model,
@@ -190,6 +197,59 @@ def _clip_for_log(text: str, limit: int = 200) -> str:
     if len(s) <= limit:
         return s
     return s[:limit] + "...(truncated)"
+
+
+def _demo_cache_meta(req: SuggestRequest) -> dict[str, str] | None:
+    extra = req.extra or {}
+    demo_key = str(extra.get("demo_key") or "").strip().lower()
+    if not demo_key:
+        return None
+    cfg = resolve_llm_config(require_token=False)
+    return {
+        "build_id": _runtime_build_id(),
+        "demo_key": demo_key,
+        "intent": (req.last_command or "").strip(),
+        "platform": (req.platform or "").strip(),
+        "provider": cfg.provider if cfg else "",
+        "model": cfg.model if cfg else "",
+    }
+
+
+def _load_demo_cached_suggestions(req: SuggestRequest) -> list[CommandSuggestion] | None:
+    meta = _demo_cache_meta(req)
+    if not meta:
+        return None
+    try:
+        cached = load_demo_suggestions(**meta)
+        if cached:
+            logger.info(
+                "demo_cache_hit demo=%s intent=%s count=%s",
+                meta["demo_key"],
+                _clip_for_log(meta["intent"], 120),
+                len(cached),
+            )
+        return cached
+    except Exception as exc:
+        logger.warning("demo_cache_load_failed demo=%s err=%s", meta["demo_key"], exc)
+        return None
+
+
+def _save_demo_cached_suggestions(
+    req: SuggestRequest, suggestions: list[CommandSuggestion]
+) -> None:
+    meta = _demo_cache_meta(req)
+    if not meta or not suggestions:
+        return
+    try:
+        save_demo_suggestions(suggestions=suggestions, **meta)
+        logger.info(
+            "demo_cache_saved demo=%s intent=%s count=%s",
+            meta["demo_key"],
+            _clip_for_log(meta["intent"], 120),
+            len(suggestions),
+        )
+    except Exception as exc:
+        logger.warning("demo_cache_save_failed demo=%s err=%s", meta["demo_key"], exc)
 
 
 def _apply_policy_hints(suggestions: list[CommandSuggestion]) -> None:
@@ -700,7 +760,15 @@ def api_plan_generate(req: PlanGenerateRequest) -> PlanGenerateResponse:
     if req.suggestions:
         plan = build_execution_plan(intent=req.intent, suggestions=req.suggestions)
     elif req.intent and _llm_enabled():
-        plan = executor_agent.generate_dag(req.intent, platform=req.platform)
+        try:
+            plan = executor_agent.generate_dag(req.intent, platform=req.platform)
+        except Exception as exc:
+            logger.warning(
+                "api_plan_generate llm_fallback intent=%s err=%s",
+                _clip_for_log(req.intent or "", 160),
+                _clip_for_log(str(exc), 200),
+            )
+            plan = None
         if plan is None:
             plan = build_execution_plan(intent=req.intent, suggestions=[])
     else:
@@ -755,6 +823,28 @@ async def api_suggest_stream(req: SuggestRequest) -> StreamingResponse:
     def _run_orchestrator() -> None:
         """鍦ㄧ嚎绋嬩腑杩愯 Multi-Agent锛屼簨浠舵帹閫佸埌闃熷垪"""
         try:
+            cached_demo_suggestions = _load_demo_cached_suggestions(req)
+            if cached_demo_suggestions:
+                q.put(
+                    {
+                        "type": "agent_progress",
+                        "agent": "orchestrator",
+                        "status": "done",
+                        "message": "Demo cache hit. Reusing the last successful LLM result.",
+                    }
+                )
+                q.put(
+                    {
+                        "type": "suggestions",
+                        "session_id": str(session.id),
+                        "suggestions": [
+                            s.model_dump() for s in cached_demo_suggestions
+                        ],
+                        "steps": STORE.to_dict_steps(session),
+                    }
+                )
+                return
+
             rule_suggestions = suggest(req, allow_orchestrator=False)
             _apply_policy_hints(rule_suggestions)
 
@@ -802,6 +892,7 @@ async def api_suggest_stream(req: SuggestRequest) -> StreamingResponse:
                     conversation_messages=req.conversation_messages,
                 )
                 _apply_policy_hints(final)
+                _save_demo_cached_suggestions(req, final)
             else:
                 q.put(
                     {
@@ -823,6 +914,11 @@ async def api_suggest_stream(req: SuggestRequest) -> StreamingResponse:
             )
             return
         except Exception as e:
+            logger.exception(
+                "api_suggest_stream failed session=%s last=%s",
+                req.session_id,
+                _clip_for_log(req.last_command or "", 160),
+            )
             q.put({"type": "error", "message": str(e)[:200]})
         finally:
             q.put(None)  # 缁撴潫鍝ㄥ叺
@@ -1003,13 +1099,19 @@ def api_llm_test(req: LlmTestRequest) -> LlmTestResponse:
     start = time.perf_counter()
     try:
         url = base_url + "chat/completions"
+        temperature = normalize_chat_temperature(
+            provider=provider,
+            base_url=base_url,
+            model=model,
+            temperature=0.0,
+        )
         payload = {
             "model": model,
             "messages": [
                 {"role": "system", "content": "You are a helpful assistant."},
                 {"role": "user", "content": prompt},
             ],
-            "temperature": 0.0,
+            "temperature": temperature,
             "max_tokens": 16,
             "stream": False,
         }
@@ -1025,7 +1127,7 @@ def api_llm_test(req: LlmTestRequest) -> LlmTestResponse:
         )
 
         try:
-            with urllib.request.urlopen(
+            with urlopen_without_proxy(
                 http_req, timeout=(cfg.timeout_seconds if cfg else 20.0)
             ) as resp:
                 body = resp.read().decode("utf-8")
