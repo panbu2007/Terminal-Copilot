@@ -54,6 +54,8 @@ const nodePopoverEl = document.getElementById('nodePopover');
 const nodePopoverTitleEl = document.getElementById('nodePopoverTitle');
 const nodePopoverBodyEl = document.getElementById('nodePopoverBody');
 const nodePopoverCloseEl = document.getElementById('nodePopoverClose');
+const topbarEl = document.querySelector('.topbar');
+const layoutEl = document.querySelector('.layout');
 const onboardingEl = document.getElementById('onboarding');
 const onboardingCloseEl = document.getElementById('onboardingClose');
 const demoBtnEls = Array.from(document.querySelectorAll('.demo-btn'));
@@ -404,6 +406,37 @@ function switchSidePanel(name) {
       });
     });
   }
+}
+
+function refreshResponsiveLayout() {
+  requestAnimationFrame(() => {
+    try {
+      if (fitAddon) fitAddon.fit();
+    } catch {
+      // ignore
+    }
+
+    try {
+      if (currentPlan) planRenderer.fit();
+    } catch {
+      // ignore
+    }
+
+    try {
+      if (
+        nodePopoverEl &&
+        !nodePopoverEl.classList.contains('hidden') &&
+        currentPopoverNodeId &&
+        currentPlan &&
+        Array.isArray(currentPlan.nodes)
+      ) {
+        const node = currentPlan.nodes.find((item) => item && item.id === currentPopoverNodeId);
+        if (node) openNodePopover(node, null, pendingPlanApprovals.has(node.id));
+      }
+    } catch {
+      // ignore
+    }
+  });
 }
 
 function setPlanUnread(hasUnread) {
@@ -1216,16 +1249,19 @@ function openNodePopover(node, target, forceApproval = false) {
   currentPopoverNodeId = node.id || '';
   nodePopoverTitleEl.textContent = node.title || node.id;
   renderNodePopoverBody(node, forceApproval);
+  const popoverWidth = Math.min(300, Math.max(240, window.innerWidth - 24));
+  const popoverHeight = Math.min(360, Math.max(220, window.innerHeight - 96));
   const currentLeft = parseInt(nodePopoverEl.style.left || '0', 10);
   const currentTop = parseInt(nodePopoverEl.style.top || '0', 10);
   const hasPinnedPosition = !Number.isNaN(currentLeft) && !Number.isNaN(currentTop) && !target;
   const rect = target && target.getBoundingClientRect
     ? target.getBoundingClientRect()
     : hasPinnedPosition
-      ? { right: currentLeft + 300, top: currentTop }
+      ? { right: currentLeft + popoverWidth, top: currentTop }
       : { right: window.innerWidth / 2, top: window.innerHeight / 2 };
-  nodePopoverEl.style.left = `${Math.max(12, Math.min(window.innerWidth - 320, rect.right + 8))}px`;
-  nodePopoverEl.style.top = `${Math.max(76, Math.min(window.innerHeight - 360, rect.top))}px`;
+  nodePopoverEl.style.width = `${popoverWidth}px`;
+  nodePopoverEl.style.left = `${Math.max(12, Math.min(window.innerWidth - popoverWidth - 12, rect.right + 8))}px`;
+  nodePopoverEl.style.top = `${Math.max(76, Math.min(window.innerHeight - popoverHeight - 12, rect.top))}px`;
   nodePopoverEl.classList.remove('hidden');
 }
 
@@ -2538,24 +2574,19 @@ try {
     fitAddon = new FitAddon.FitAddon();
     term.loadAddon(fitAddon);
     fitAddon.fit();
-    window.addEventListener('resize', () => {
-      try {
-        fitAddon.fit();
-      } catch {
-        // ignore
-      }
-    });
   }
 } catch {
   // ignore
 }
-window.addEventListener('resize', () => {
-  try {
-    planRenderer.fit();
-  } catch {
-    // ignore
-  }
-});
+window.addEventListener('resize', refreshResponsiveLayout);
+if (typeof ResizeObserver !== 'undefined') {
+  const responsiveObserver = new ResizeObserver(() => {
+    refreshResponsiveLayout();
+  });
+  if (topbarEl) responsiveObserver.observe(topbarEl);
+  if (layoutEl) responsiveObserver.observe(layoutEl);
+  if (onboardingEl) responsiveObserver.observe(onboardingEl);
+}
 
 let currentLine = '';
 let cursorPos = 0;
@@ -3062,6 +3093,7 @@ renderAgentPanel();
 planRenderer.clear();
 renderAuditReport(null);
 if (onboardingEl) onboardingEl.classList.remove('hidden');
+refreshResponsiveLayout();
 
 async function refreshRunbookList() {
   if (!runbookListEl) return;
@@ -3249,18 +3281,25 @@ for (const btn of demoBtnEls) {
     const key = String(btn.getAttribute('data-demo') || '').trim();
     if (key === 'custom') {
       if (onboardingEl) onboardingEl.classList.add('hidden');
+      refreshResponsiveLayout();
       writeInfoAbovePrompt('请输入自然语言问题后回车，系统会生成执行计划。');
       return;
     }
     const intent = DEMO_INTENTS[key];
     if (!intent) return;
     if (onboardingEl) onboardingEl.classList.add('hidden');
+    refreshResponsiveLayout();
     await ensureDemoContext(key);
     echoIntentToTerminal(intent);
     await startIntentIteration(intent, { autoExecute: false });
   });
 }
-if (onboardingCloseEl) onboardingCloseEl.addEventListener('click', () => onboardingEl && onboardingEl.classList.add('hidden'));
+if (onboardingCloseEl) {
+  onboardingCloseEl.addEventListener('click', () => {
+    if (onboardingEl) onboardingEl.classList.add('hidden');
+    refreshResponsiveLayout();
+  });
+}
 
 if (runbooksBtn) runbooksBtn.addEventListener('click', () => openRunbookModal());
 if (runbookCloseEl) runbookCloseEl.addEventListener('click', () => closeRunbookModal());
